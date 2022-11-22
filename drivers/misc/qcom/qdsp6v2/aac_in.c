@@ -1,709 +1,1475 @@
-/*
- * Copyright (c) 2010-2017, The Linux Foundation. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- */
-#include <linux/module.h>
-#include <linux/fs.h>
-#include <linux/miscdevice.h>
-#include <linux/uaccess.h>
-#include <linux/sched.h>
-#include <linux/wait.h>
-#include <linux/dma-mapping.h>
-#include <linux/slab.h>
-#include <linux/msm_audio_aac.h>
-#include <linux/compat.h>
-#include <asm/atomic.h>
-#include <asm/ioctls.h>
-#include "audio_utils.h"
-
-
-/* Buffer with meta*/
-#define PCM_BUF_SIZE		(4096 + sizeof(struct meta_in))
-
-/* Maximum 5 frames in buffer with meta */
-#define FRAME_SIZE		(1 + ((1536+sizeof(struct meta_out_dsp)) * 5))
-
-#define AAC_FORMAT_ADTS 65535
-
-#define MAX_SAMPLE_RATE_384K 384000
-
-static long aac_in_ioctl_shared(struct file *file, unsigned int cmd, void *arg)
-{
-	struct q6audio_in  *audio = file->private_data;
-	int rc = 0;
-	int cnt = 0;
-
-	switch (cmd) {
-	case AUDIO_START: {
-		struct msm_audio_aac_enc_config *enc_cfg;
-		struct msm_audio_aac_config *aac_config;
-		uint32_t aac_mode = AAC_ENC_MODE_AAC_LC;
-
-		enc_cfg = audio->enc_cfg;
-		aac_config = audio->codec_cfg;
-		/* ENCODE CFG (after new set of API's are published )bharath*/
-		pr_debug("%s:session id %d: default buf alloc[%d]\n", __func__,
-				audio->ac->session, audio->buf_alloc);
-		if (audio->enabled == 1) {
-			pr_info("%s:AUDIO_START already over\n", __func__);
-			rc = 0;
-			break;
-		}
-
-		if (audio->opened) {
-			rc = audio_in_buf_alloc(audio);
-			if (rc < 0) {
-				pr_err("%s:session id %d: buffer allocation failed\n",
-					 __func__, audio->ac->session);
-				break;
-			}
-		} else {
-			if (audio->feedback == NON_TUNNEL_MODE) {
-				pr_debug("%s: starting in non_tunnel mode",
-					__func__);
-				rc = q6asm_open_read_write(audio->ac,
-					FORMAT_MPEG4_AAC, FORMAT_LINEAR_PCM);
-				if (rc < 0) {
-					pr_err("%s:open read write failed\n",
-						__func__);
-					break;
-				}
-			}
-			if (audio->feedback == TUNNEL_MODE) {
-				pr_debug("%s: starting in tunnel mode",
-					__func__);
-				rc = q6asm_open_read(audio->ac,
-							FORMAT_MPEG4_AAC);
-
-				if (rc < 0) {
-					pr_err("%s:open read failed\n",
-							__func__);
-					break;
-				}
-			}
-			audio->stopped = 0;
-		}
-
-		pr_debug("%s:sbr_ps_flag = %d, sbr_flag = %d\n", __func__,
-			aac_config->sbr_ps_on_flag, aac_config->sbr_on_flag);
-		if (aac_config->sbr_ps_on_flag)
-			aac_mode = AAC_ENC_MODE_EAAC_P;
-		else if (aac_config->sbr_on_flag)
-			aac_mode = AAC_ENC_MODE_AAC_P;
-		else
-			aac_mode = AAC_ENC_MODE_AAC_LC;
-
-		rc = q6asm_enc_cfg_blk_aac(audio->ac,
-					audio->buf_cfg.frames_per_buf,
-					enc_cfg->sample_rate,
-					enc_cfg->channels,
-					enc_cfg->bit_rate,
-					aac_mode,
-					enc_cfg->stream_format);
-		if (rc < 0) {
-			pr_err("%s:session id %d: cmd media format block"
-				"failed\n", __func__, audio->ac->session);
-			break;
-		}
-		if (audio->feedback == NON_TUNNEL_MODE) {
-			rc = q6asm_media_format_block_pcm(audio->ac,
-						audio->pcm_cfg.sample_rate,
-						audio->pcm_cfg.channel_count);
-			if (rc < 0) {
-				pr_err("%s:session id %d: media format block"
-				"failed\n", __func__, audio->ac->session);
-				break;
-			}
-		}
-		rc = audio_in_enable(audio);
-		if (!rc) {
-			audio->enabled = 1;
-		} else {
-			audio->enabled = 0;
-			pr_err("%s:session id %d: Audio Start procedure"
-			"failed rc=%d\n", __func__, audio->ac->session, rc);
-			break;
-		}
-		while (cnt++ < audio->str_cfg.buffer_count)
-			q6asm_read(audio->ac);
-		pr_debug("%s:session id %d: AUDIO_START success enable[%d]\n",
-				__func__, audio->ac->session, audio->enabled);
-		break;
-	}
-	case AUDIO_STOP: {
-		pr_debug("%s:session id %d: Rxed AUDIO_STOP\n", __func__,
-				audio->ac->session);
-		rc = audio_in_disable(audio);
-		if (rc  < 0) {
-			pr_err("%s:session id %d: Audio Stop procedure failed"
-				"rc=%d\n", __func__, audio->ac->session, rc);
-			break;
-		}
-		break;
-	}
-	case AUDIO_GET_AAC_ENC_CONFIG: {
-		struct msm_audio_aac_enc_config *cfg;
-		struct msm_audio_aac_enc_config *enc_cfg;
-
-		cfg = (struct msm_audio_aac_enc_config *)arg;
-		if (cfg == NULL) {
-			pr_err("%s: NULL config pointer for %s\n",
-			__func__, "AUDIO_GET_AAC_CONFIG");
-			rc = -EINVAL;
-			break;
-		}
-		memset(cfg, 0, sizeof(*cfg));
-		enc_cfg = audio->enc_cfg;
-		if (enc_cfg->channels == CH_MODE_MONO)
-			cfg->channels = 1;
-		else
-			cfg->channels = 2;
-
-		cfg->sample_rate = enc_cfg->sample_rate;
-		cfg->bit_rate = enc_cfg->bit_rate;
-		switch (enc_cfg->stream_format) {
-		case 0x00:
-			cfg->stream_format = AUDIO_AAC_FORMAT_ADTS;
-			break;
-		case 0x01:
-			cfg->stream_format = AUDIO_AAC_FORMAT_LOAS;
-			break;
-		case 0x02:
-			cfg->stream_format = AUDIO_AAC_FORMAT_ADIF;
-			break;
-		default:
-		case 0x03:
-			cfg->stream_format = AUDIO_AAC_FORMAT_RAW;
-		}
-		pr_debug("%s:session id %d: Get-aac-cfg: format=%d sr=%d"
-			"bitrate=%d\n", __func__, audio->ac->session,
-			cfg->stream_format, cfg->sample_rate, cfg->bit_rate);
-		break;
-	}
-	case AUDIO_SET_AAC_ENC_CONFIG: {
-		struct msm_audio_aac_enc_config *cfg;
-		struct msm_audio_aac_enc_config *enc_cfg;
-		uint32_t min_bitrate, max_bitrate;
-
-		cfg = (struct msm_audio_aac_enc_config *)arg;
-		if (cfg == NULL) {
-			pr_err("%s: NULL config pointer for %s\n",
-			"AUDIO_SET_AAC_ENC_CONFIG", __func__);
-			rc = -EINVAL;
-			break;
-		}
-		enc_cfg = audio->enc_cfg;
-		pr_debug("%s:session id %d: Set-aac-cfg: stream=%d\n", __func__,
-			audio->ac->session, cfg->stream_format);
-
-		switch (cfg->stream_format) {
-		case AUDIO_AAC_FORMAT_ADTS:
-			enc_cfg->stream_format = 0x00;
-			break;
-		case AUDIO_AAC_FORMAT_LOAS:
-			enc_cfg->stream_format = 0x01;
-			break;
-		case AUDIO_AAC_FORMAT_ADIF:
-			enc_cfg->stream_format = 0x02;
-			break;
-		case AUDIO_AAC_FORMAT_RAW:
-			enc_cfg->stream_format = 0x03;
-			break;
-		default:
-			pr_err("%s:session id %d: unsupported AAC format %d\n",
-				__func__, audio->ac->session,
-				cfg->stream_format);
-			rc = -EINVAL;
-			break;
-		}
-
-		if (cfg->channels == 1) {
-			cfg->channels = CH_MODE_MONO;
-		} else if (cfg->channels == 2) {
-			cfg->channels = CH_MODE_STEREO;
-		} else {
-			rc = -EINVAL;
-			break;
-		}
-
-		if (cfg->sample_rate > MAX_SAMPLE_RATE_384K) {
-			pr_err("%s: ERROR: invalid sample rate = %u",
-				__func__, cfg->sample_rate);
-			rc = -EINVAL;
-			break;
-		}
-
-		min_bitrate = ((cfg->sample_rate)*(cfg->channels))/2;
-		/* This calculation should be based on AAC mode. But we cannot
-		 * get AAC mode in this setconfig. min_bitrate's logical max
-		 * value is 24000. So if min_bitrate is higher than 24000,
-		 * choose 24000.
-		 */
-		if (min_bitrate > 24000)
-			min_bitrate = 24000;
-		max_bitrate = 6*(cfg->sample_rate)*(cfg->channels);
-		if (max_bitrate > 192000)
-			max_bitrate = 192000;
-		if ((cfg->bit_rate < min_bitrate) ||
-			(cfg->bit_rate > max_bitrate)) {
-			pr_err("%s: bitrate permissible: max=%d, min=%d\n",
-				__func__, max_bitrate, min_bitrate);
-			pr_err("%s: ERROR in setting bitrate = %d\n",
-				__func__, cfg->bit_rate);
-			rc = -EINVAL;
-			break;
-		}
-		enc_cfg->sample_rate = cfg->sample_rate;
-		enc_cfg->channels = cfg->channels;
-		enc_cfg->bit_rate = cfg->bit_rate;
-		pr_debug("%s:session id %d: Set-aac-cfg:SR= 0x%x ch=0x%x"
-			"bitrate=0x%x, format(adts/raw) = %d\n",
-			__func__, audio->ac->session, enc_cfg->sample_rate,
-			enc_cfg->channels, enc_cfg->bit_rate,
-			enc_cfg->stream_format);
-		break;
-	}
-	case AUDIO_SET_AAC_CONFIG: {
-		struct msm_audio_aac_config *aac_cfg;
-		struct msm_audio_aac_config *audio_aac_cfg;
-		struct msm_audio_aac_enc_config *enc_cfg;
-		enc_cfg = audio->enc_cfg;
-		audio_aac_cfg = audio->codec_cfg;
-		aac_cfg = (struct msm_audio_aac_config *)arg;
-
-		if (aac_cfg == NULL) {
-			pr_err("%s: NULL config pointer %s\n",
-				__func__, "AUDIO_SET_AAC_CONFIG");
-			rc = -EINVAL;
-			break;
-		}
-		pr_debug("%s:session id %d: AUDIO_SET_AAC_CONFIG: sbr_flag = %d sbr_ps_flag = %d\n",
-			 __func__, audio->ac->session, aac_cfg->sbr_on_flag,
-			 aac_cfg->sbr_ps_on_flag);
-		audio_aac_cfg->sbr_on_flag = aac_cfg->sbr_on_flag;
-		audio_aac_cfg->sbr_ps_on_flag = aac_cfg->sbr_ps_on_flag;
-		if ((audio_aac_cfg->sbr_on_flag == 1) ||
-			 (audio_aac_cfg->sbr_ps_on_flag == 1)) {
-			if (enc_cfg->sample_rate < 24000) {
-				pr_err("%s: ERROR in setting samplerate = %d"
-					"\n", __func__, enc_cfg->sample_rate);
-				rc = -EINVAL;
-				break;
-			}
-		}
-		break;
-	}
-	default:
-		pr_err("%s: Unknown ioctl cmd = %d", __func__, cmd);
-		rc = -EINVAL;
-	}
-	return rc;
-}
-
-static long aac_in_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-	struct q6audio_in  *audio = file->private_data;
-	int rc = 0;
-
-	switch (cmd) {
-	case AUDIO_START:
-	case AUDIO_STOP: {
-		rc = aac_in_ioctl_shared(file, cmd, NULL);
-		break;
-	}
-	case AUDIO_GET_AAC_ENC_CONFIG: {
-		struct msm_audio_aac_enc_config cfg;
-		rc = aac_in_ioctl_shared(file, cmd, &cfg);
-		if (rc) {
-			pr_err("%s:AUDIO_GET_AAC_ENC_CONFIG failed. rc=%d\n",
-				__func__, rc);
-			break;
-		}
-		if (copy_to_user((void *)arg, &cfg, sizeof(cfg))) {
-			pr_err("%s: copy_to_user for AUDIO_GET_AAC_ENC_CONFIG failed\n",
-				__func__);
-			rc = -EFAULT;
-		}
-		break;
-	}
-	case AUDIO_SET_AAC_ENC_CONFIG: {
-		struct msm_audio_aac_enc_config cfg;
-		if (copy_from_user(&cfg, (void *)arg, sizeof(cfg))) {
-			pr_err("%s: copy_from_user for AUDIO_SET_AAC_ENC_CONFIG failed\n",
-				__func__);
-			rc = -EFAULT;
-			break;
-		}
-		rc = aac_in_ioctl_shared(file, cmd, &cfg);
-		if (rc)
-			pr_err("%s:AUDIO_SET_AAC_ENC_CONFIG failed. rc=%d\n",
-				__func__, rc);
-		break;
-	}
-	case AUDIO_GET_AAC_CONFIG: {
-		if (copy_to_user((void *)arg, &audio->codec_cfg,
-				 sizeof(struct msm_audio_aac_config))) {
-			pr_err("%s: copy_to_user for AUDIO_GET_AAC_CONFIG failed\n",
-				__func__);
-			rc = -EFAULT;
-			break;
-		}
-		break;
-	}
-	case AUDIO_SET_AAC_CONFIG: {
-		struct msm_audio_aac_config aac_cfg;
-		if (copy_from_user(&aac_cfg, (void *)arg,
-				 sizeof(struct msm_audio_aac_config))) {
-			pr_err("%s: copy_to_user for AUDIO_SET_CONFIG failed\n",
-				__func__);
-			rc = -EFAULT;
-			break;
-		}
-		rc = aac_in_ioctl_shared(file, cmd, &aac_cfg);
-		if (rc)
-			pr_err("%s:AUDIO_SET_AAC_CONFIG failed. rc=%d\n",
-				__func__, rc);
-		break;
-	}
-	default:
-		pr_err("%s: Unknown ioctl cmd=%d\n", __func__, cmd);
-		rc = -EINVAL;
-	}
-	return rc;
-}
-
-#ifdef CONFIG_COMPAT
-struct msm_audio_aac_enc_config32 {
-	u32 channels;
-	u32 sample_rate;
-	u32 bit_rate;
-	u32 stream_format;
-};
-
-struct msm_audio_aac_config32 {
-	s16 format;
-	u16 audio_object;
-	u16 ep_config;       /* 0 ~ 3 useful only obj = ERLC */
-	u16 aac_section_data_resilience_flag;
-	u16 aac_scalefactor_data_resilience_flag;
-	u16 aac_spectral_data_resilience_flag;
-	u16 sbr_on_flag;
-	u16 sbr_ps_on_flag;
-	u16 dual_mono_mode;
-	u16 channel_configuration;
-	u16 sample_rate;
-};
-
-enum {
-	AUDIO_SET_AAC_CONFIG_32 = _IOW(AUDIO_IOCTL_MAGIC,
-	  (AUDIO_MAX_COMMON_IOCTL_NUM+0), struct msm_audio_aac_config32),
-	AUDIO_GET_AAC_CONFIG_32 = _IOR(AUDIO_IOCTL_MAGIC,
-	  (AUDIO_MAX_COMMON_IOCTL_NUM+1), struct msm_audio_aac_config32),
-	AUDIO_SET_AAC_ENC_CONFIG_32 = _IOW(AUDIO_IOCTL_MAGIC,
-	  (AUDIO_MAX_COMMON_IOCTL_NUM+3), struct msm_audio_aac_enc_config32),
-	AUDIO_GET_AAC_ENC_CONFIG_32 = _IOR(AUDIO_IOCTL_MAGIC,
-	  (AUDIO_MAX_COMMON_IOCTL_NUM+4), struct msm_audio_aac_enc_config32)
-};
-
-static long aac_in_compat_ioctl(struct file *file, unsigned int cmd,
-				unsigned long arg)
-{
-	struct q6audio_in  *audio = file->private_data;
-	int rc = 0;
-
-	switch (cmd) {
-	case AUDIO_START:
-	case AUDIO_STOP: {
-		rc = aac_in_ioctl_shared(file, cmd, NULL);
-		break;
-	}
-	case AUDIO_GET_AAC_ENC_CONFIG_32: {
-		struct msm_audio_aac_enc_config cfg;
-		struct msm_audio_aac_enc_config32 cfg_32;
-
-		memset(&cfg_32, 0, sizeof(cfg_32));
-
-		cmd = AUDIO_GET_AAC_ENC_CONFIG;
-		rc = aac_in_ioctl_shared(file, cmd, &cfg);
-		if (rc) {
-			pr_err("%s:AUDIO_GET_AAC_ENC_CONFIG_32 failed. Rc= %d\n",
-				__func__, rc);
-			break;
-		}
-		cfg_32.channels = cfg.channels;
-		cfg_32.sample_rate = cfg.sample_rate;
-		cfg_32.bit_rate = cfg.bit_rate;
-		cfg_32.stream_format = cfg.stream_format;
-		if (copy_to_user((void *)arg, &cfg_32, sizeof(cfg_32))) {
-			pr_err("%s: copy_to_user for AUDIO_GET_AAC_ENC_CONFIG_32 failed\n",
-				__func__);
-			rc = -EFAULT;
-		}
-		break;
-	}
-	case AUDIO_SET_AAC_ENC_CONFIG_32: {
-		struct msm_audio_aac_enc_config cfg;
-		struct msm_audio_aac_enc_config32 cfg_32;
-		if (copy_from_user(&cfg_32, (void *)arg, sizeof(cfg_32))) {
-			pr_err("%s: copy_from_user for AUDIO_GET_AAC_ENC_CONFIG_32 failed\n",
-				__func__);
-			rc = -EFAULT;
-			break;
-		}
-		cfg.channels = cfg_32.channels;
-		cfg.sample_rate = cfg_32.sample_rate;
-		cfg.bit_rate = cfg_32.bit_rate;
-		cfg.stream_format = cfg_32.stream_format;
-		/* The command should be converted from 32 bit to normal
-		 * before the shared ioctl is called as shared ioctl
-		 * can process only normal commands */
-		cmd = AUDIO_SET_AAC_ENC_CONFIG;
-		rc = aac_in_ioctl_shared(file, cmd, &cfg);
-		if (rc)
-			pr_err("%s:AUDIO_SET_AAC_ENC_CONFIG_32 failed. rc=%d\n",
-				__func__, rc);
-		break;
-	}
-	case AUDIO_GET_AAC_CONFIG_32: {
-		struct msm_audio_aac_config *aac_config;
-		struct msm_audio_aac_config32 aac_config_32;
-
-		aac_config = (struct msm_audio_aac_config *)audio->codec_cfg;
-		aac_config_32.format = aac_config->format;
-		aac_config_32.audio_object = aac_config->audio_object;
-		aac_config_32.ep_config = aac_config->ep_config;
-		aac_config_32.aac_section_data_resilience_flag =
-			aac_config->aac_section_data_resilience_flag;
-		aac_config_32.aac_scalefactor_data_resilience_flag =
-			aac_config->aac_scalefactor_data_resilience_flag;
-		aac_config_32.aac_spectral_data_resilience_flag =
-			aac_config->aac_spectral_data_resilience_flag;
-		aac_config_32.sbr_on_flag = aac_config->sbr_on_flag;
-		aac_config_32.sbr_ps_on_flag = aac_config->sbr_ps_on_flag;
-		aac_config_32.dual_mono_mode = aac_config->dual_mono_mode;
-		aac_config_32.channel_configuration =
-				aac_config->channel_configuration;
-		aac_config_32.sample_rate = aac_config->sample_rate;
-
-		if (copy_to_user((void *)arg, &aac_config_32,
-				 sizeof(aac_config_32))) {
-			pr_err("%s: copy_to_user for AUDIO_GET_AAC_CONFIG_32 failed\n",
-				__func__);
-			rc = -EFAULT;
-			break;
-		}
-		break;
-	}
-	case AUDIO_SET_AAC_CONFIG_32: {
-		struct msm_audio_aac_config aac_cfg;
-		struct msm_audio_aac_config32 aac_cfg_32;
-		if (copy_from_user(&aac_cfg_32, (void *)arg,
-					sizeof(aac_cfg_32))) {
-			pr_err("%s: copy_from_user for AUDIO_SET_AAC_CONFIG_32 failed\n",
-				__func__);
-			rc = -EFAULT;
-			break;
-		}
-		aac_cfg.format = aac_cfg_32.format;
-		aac_cfg.audio_object = aac_cfg_32.audio_object;
-		aac_cfg.ep_config = aac_cfg_32.ep_config;
-		aac_cfg.aac_section_data_resilience_flag =
-			aac_cfg_32.aac_section_data_resilience_flag;
-		aac_cfg.aac_scalefactor_data_resilience_flag =
-			aac_cfg_32.aac_scalefactor_data_resilience_flag;
-		aac_cfg.aac_spectral_data_resilience_flag =
-			aac_cfg_32.aac_spectral_data_resilience_flag;
-		aac_cfg.sbr_on_flag = aac_cfg_32.sbr_on_flag;
-		aac_cfg.sbr_ps_on_flag = aac_cfg_32.sbr_ps_on_flag;
-		aac_cfg.dual_mono_mode = aac_cfg_32.dual_mono_mode;
-		aac_cfg.channel_configuration =
-				aac_cfg_32.channel_configuration;
-		aac_cfg.sample_rate = aac_cfg_32.sample_rate;
-
-		cmd = AUDIO_SET_AAC_CONFIG;
-		rc = aac_in_ioctl_shared(file, cmd, &aac_cfg);
-		if (rc)
-			pr_err("%s:AUDIO_SET_AAC_CONFIG failed. Rc= %d\n",
-				__func__, rc);
-		break;
-	}
-	default:
-		pr_err("%s: Unknown ioctl cmd = %d\n", __func__, cmd);
-		rc = -EINVAL;
-	}
-	return rc;
-}
-#else
-#define aac_in_compat_ioctl NULL
-#endif
-
-static int aac_in_open(struct inode *inode, struct file *file)
-{
-	struct q6audio_in *audio = NULL;
-	struct msm_audio_aac_enc_config *enc_cfg;
-	struct msm_audio_aac_config *aac_config;
-	int rc = 0;
-
-	audio = kzalloc(sizeof(struct q6audio_in), GFP_KERNEL);
-
-	if (audio == NULL) {
-		pr_err("%s: Could not allocate memory for aac"
-				"driver\n", __func__);
-		return -ENOMEM;
-	}
-	/* Allocate memory for encoder config param */
-	audio->enc_cfg = kzalloc(sizeof(struct msm_audio_aac_enc_config),
-				GFP_KERNEL);
-	if (audio->enc_cfg == NULL) {
-		pr_err("%s:session id %d: Could not allocate memory for aac"
-				"config param\n", __func__, audio->ac->session);
-		kfree(audio);
-		return -ENOMEM;
-	}
-	enc_cfg = audio->enc_cfg;
-
-	audio->codec_cfg = kzalloc(sizeof(struct msm_audio_aac_config),
-				GFP_KERNEL);
-	if (audio->codec_cfg == NULL) {
-		pr_err("%s:session id %d: Could not allocate memory for aac"
-				"config\n", __func__, audio->ac->session);
-		kfree(audio->enc_cfg);
-		kfree(audio);
-		return -ENOMEM;
-	}
-	aac_config = audio->codec_cfg;
-
-	mutex_init(&audio->lock);
-	mutex_init(&audio->read_lock);
-	mutex_init(&audio->write_lock);
-	spin_lock_init(&audio->dsp_lock);
-	init_waitqueue_head(&audio->read_wait);
-	init_waitqueue_head(&audio->write_wait);
-
-	/* Settings will be re-config at AUDIO_SET_CONFIG,
-	* but at least we need to have initial config
-	*/
-	audio->str_cfg.buffer_size = FRAME_SIZE;
-	audio->str_cfg.buffer_count = FRAME_NUM;
-	audio->min_frame_size = 1536;
-	audio->max_frames_per_buf = 5;
-	enc_cfg->sample_rate = 8000;
-	enc_cfg->channels = 1;
-	enc_cfg->bit_rate = 16000;
-	enc_cfg->stream_format = 0x00;/* 0:ADTS, 3:RAW */
-	audio->buf_cfg.meta_info_enable = 0x01;
-	audio->buf_cfg.frames_per_buf   = 0x01;
-	audio->pcm_cfg.buffer_count = PCM_BUF_COUNT;
-	audio->pcm_cfg.buffer_size  = PCM_BUF_SIZE;
-	aac_config->format = AUDIO_AAC_FORMAT_ADTS;
-	aac_config->audio_object = AUDIO_AAC_OBJECT_LC;
-	aac_config->sbr_on_flag = 0;
-	aac_config->sbr_ps_on_flag = 0;
-	aac_config->channel_configuration = 1;
-
-	audio->ac = q6asm_audio_client_alloc((app_cb)q6asm_in_cb,
-							(void *)audio);
-
-	if (!audio->ac) {
-		pr_err("%s: Could not allocate memory for"
-				"audio client\n", __func__);
-		kfree(audio->enc_cfg);
-		kfree(audio->codec_cfg);
-		kfree(audio);
-		return -ENOMEM;
-	}
-	/* open aac encoder in tunnel mode */
-	audio->buf_cfg.frames_per_buf = 0x01;
-
-	if ((file->f_mode & FMODE_WRITE) &&
-		(file->f_mode & FMODE_READ)) {
-		audio->feedback = NON_TUNNEL_MODE;
-		rc = q6asm_open_read_write(audio->ac, FORMAT_MPEG4_AAC,
-						FORMAT_LINEAR_PCM);
-
-		if (rc < 0) {
-			pr_err("%s:session id %d: NT Open failed rc=%d\n",
-				__func__, audio->ac->session, rc);
-			rc = -ENODEV;
-			goto fail;
-		}
-		audio->buf_cfg.meta_info_enable = 0x01;
-		pr_info("%s:session id %d: NT mode encoder success\n", __func__,
-				audio->ac->session);
-	} else if (!(file->f_mode & FMODE_WRITE) &&
-				(file->f_mode & FMODE_READ)) {
-		audio->feedback = TUNNEL_MODE;
-		rc = q6asm_open_read(audio->ac, FORMAT_MPEG4_AAC);
-
-		if (rc < 0) {
-			pr_err("%s:session id %d: Tunnel Open failed rc=%d\n",
-				__func__, audio->ac->session, rc);
-			rc = -ENODEV;
-			goto fail;
-		}
-		/* register for tx overflow (valid for tunnel mode only) */
-		rc = q6asm_reg_tx_overflow(audio->ac, 0x01);
-		if (rc < 0) {
-			pr_err("%s:session id %d: TX Overflow registration"
-				"failed rc=%d\n", __func__,
-				audio->ac->session, rc);
-			rc = -ENODEV;
-			goto fail;
-		}
-		audio->buf_cfg.meta_info_enable = 0x00;
-		pr_info("%s:session id %d: T mode encoder success\n", __func__,
-			audio->ac->session);
-	} else {
-		pr_err("%s:session id %d: Unexpected mode\n", __func__,
-				audio->ac->session);
-		rc = -EACCES;
-		goto fail;
-	}
-	audio->opened = 1;
-	audio->reset_event = false;
-	atomic_set(&audio->in_count, PCM_BUF_COUNT);
-	atomic_set(&audio->out_count, 0x00);
-	audio->enc_compat_ioctl = aac_in_compat_ioctl;
-	audio->enc_ioctl = aac_in_ioctl;
-	file->private_data = audio;
-
-	pr_info("%s:session id %d: success\n", __func__, audio->ac->session);
-	return 0;
-fail:
-	q6asm_audio_client_free(audio->ac);
-	kfree(audio->enc_cfg);
-	kfree(audio->codec_cfg);
-	kfree(audio);
-	return rc;
-}
-
-static const struct file_operations audio_in_fops = {
-	.owner		= THIS_MODULE,
-	.open		= aac_in_open,
-	.release	= audio_in_release,
-	.read		= audio_in_read,
-	.write		= audio_in_write,
-	.unlocked_ioctl	= audio_in_ioctl,
-	.compat_ioctl	= audio_in_compat_ioctl
-};
-
-struct miscdevice audio_aac_in_misc = {
-	.minor	= MISC_DYNAMIC_MINOR,
-	.name	= "msm_aac_in",
-	.fops	= &audio_in_fops,
-};
-
-static int __init aac_in_init(void)
-{
-	return misc_register(&audio_aac_in_misc);
-}
-device_initcall(aac_in_init);
+#
+# Automatically generated file; DO NOT EDIT.
+# Linux/arm64 3.18.71 Kernel Configuration
+# CONFIG_HQ_KERNEL=y
+CONFIG_ARM64=y
+CONFIG_64BIT=y
+CONFIG_ARCH_PHYS_ADDR_T_64BIT=y
+CONFIG_MMU=y
+CONFIG_ARCH_MMAP_RND_BITS_MIN=18
+CONFIG_ARCH_MMAP_RND_BITS_MAX=24
+CONFIG_ARCH_MMAP_RND_COMPAT_BITS_MIN=11
+CONFIG_ARCH_MMAP_RND_COMPAT_BITS_MAX=16
+CONFIG_ILLEGAL_POINTER_VALUE=0xdead000000000000
+CONFIG_STACKTRACE_SUPPORT=y
+CONFIG_LOCKDEP_SUPPORT=y
+CONFIG_TRACE_IRQFLAGS_SUPPORT=y
+CONFIG_RWSEM_XCHGADD_ALGORITHM=y
+# CONFIG_GENERIC_BUG is not set
+# CONFIG_GENERIC_HWEIGHT is not set
+# CONFIG_GENERIC_CSUM is not set
+# CONFIG_GENERIC_CALIBRATE_DELAY=y
+CONFIG_ZONE_DMA=y
+# CONFIG_HAVE_GENERIC_RCU_GUP is not set
+CONFIG_ARCH_DMA_ADDR_T_64BIT=y
+CONFIG_NEED_DMA_MAP_STATE=y
+CONFIG_NEED_SG_DMA_LENGTH=y
+CONFIG_ARM64_DMA_USE_IOMMU=y
+CONFIG_ARM64_DMA_IOMMU_ALIGNMENT=8
+CONFIG_SMP=y
+CONFIG_SWIOTLB=y
+CONFIG_IOMMU_HELPER=y
+CONFIG_KERNEL_MODE_NEON=y
+CONFIG_FIX_EARLYCON_MEM=y
+CONFIG_PGTABLE_LEVELS=3
+CONFIG_DEFCONFIG_LIST="/lib/modules/$UNAME_RELEASE/.config"
+CONFIG_IRQ_WORK=y
+CONFIG_BUILDTIME_EXTABLE_SORT=y
+CONFIG_INIT_ENV_ARG_LIMIT=32
+CONFIG_CROSS_COMPILE=""
+CONFIG_LOCALVERSION="-perf"
+CONFIG_LOCALVERSION_AUTO=y
+CONFIG_DEFAULT_HOSTNAME="(none)"
+CONFIG_SWAP=y
+CONFIG_CROSS_MEMORY_ATTACH=y
+CONFIG_AUDIT=y
+# CONFIG_HAVE_ARCH_AUDITSYSCALL is not set
+CONFIG_AUDITSYSCALL=y
+CONFIG_AUDIT_WATCH=y
+CONFIG_AUDIT_TREE=y
+# CONFIG_GENERIC_IRQ_PROBE is not set
+# CONFIG_GENERIC_IRQ_SHOW is not set
+CONFIG_HARDIRQS_SW_RESEND=y
+CONFIG_IRQ_DOMAIN=y
+CONFIG_IRQ_DOMAIN_HIERARCHY=y
+# CONFIG_GENERIC_MSI_IRQ is not set
+# CONFIG_GENERIC_MSI_IRQ_DOMAIN is not set
+CONFIG_HANDLE_DOMAIN_IRQ=y
+CONFIG_SPARSE_IRQ=y
+# CONFIG_GENERIC_TIME_VSYSCALL is not set
+# CONFIG_GENERIC_CLOCKEVENTS is not set
+# CONFIG_GENERIC_CLOCKEVENTS_BUILD is not set
+CONFIG_ARCH_HAS_TICK_BROADCAST=y
+# CONFIG_GENERIC_CLOCKEVENTS_BROADCAST is not set
+# ONFIG_NO_HZ_COMMON is not set
+CONFIG_NO_HZ_IDLE=y
+CONFIG_NO_HZ=y
+CONFIG_HIGH_RES_TIMERS=y
+CONFIG_TICK_CPU_ACCOUNTING=y
+CONFIG_TASKSTATS=y
+CONFIG_TASK_XACCT=y
+CONFIG_TASK_IO_ACCOUNTING=y
+CONFIG_TREE_PREEMPT_RCU=y
+CONFIG_PREEMPT_RCU=y
+CONFIG_RCU_STALL_COMMON=y
+CONFIG_RCU_FANOUT=64
+CONFIG_RCU_FANOUT_LEAF=16
+CONFIG_RCU_FAST_NO_HZ=y
+CONFIG_RCU_BOOST=y
+CONFIG_RCU_BOOST_PRIO=1
+CONFIG_RCU_BOOST_DELAY=500
+CONFIG_RCU_NOCB_CPU=y
+CONFIG_RCU_NOCB_CPU_ALL=y
+CONFIG_BUILD_BIN2C=y
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+CONFIG_LOG_BUF_SHIFT=19
+CONFIG_LOG_CPU_MAX_BUF_SHIFT=12
+# CONFIG_GENERIC_SCHED_CLOCK is not set
+CONFIG_CGROUPS=y
+CONFIG_CGROUP_FREEZER=y
+CONFIG_CGROUP_CPUACCT=y
+CONFIG_RESOURCE_COUNTERS=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_FAIR_GROUP_SCHED=y
+CONFIG_RT_GROUP_SCHED=y
+CONFIG_SCHED_HMP=y
+CONFIG_SCHED_CORE_CTL=y
+CONFIG_SCHED_QHMP=y
+CONFIG_NAMESPACES=y
+CONFIG_NET_NS=y
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_INITRAMFS_SOURCE=""
+CONFIG_RD_GZIP=y
+CONFIG_RD_BZIP2=y
+CONFIG_RD_LZMA=y
+CONFIG_CC_OPTIMIZE_FOR_SIZE=y
+CONFIG_SYSCTL=y
+CONFIG_ANON_INODES=y
+# CONFIG_HAVE_UID16 is not set
+CONFIG_SYSCTL_EXCEPTION_TRACE=y
+CONFIG_BPF=y
+CONFIG_EXPERT=y
+CONFIG_UID16=y
+CONFIG_SYSFS_SYSCALL=y
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+CONFIG_PRINTK=y
+CONFIG_BUG=y
+CONFIG_ELF_CORE=y
+CONFIG_BASE_FULL=y
+CONFIG_FUTEX=y
+CONFIG_EPOLL=y
+CONFIG_SIGNALFD=y
+CONFIG_TIMERFD=y
+CONFIG_EVENTFD=y
+CONFIG_SHMEM=y
+CONFIG_AIO=y
+CONFIG_ADVISE_SYSCALLS=y
+CONFIG_PCI_QUIRKS=y
+CONFIG_EMBEDDED=y
+# CONFIG_HAVE_PERF_EVENTS is not set
+CONFIG_PERF_USE_VMALLOC=y
+CONFIG_PERF_EVENTS=y
+CONFIG_VM_EVENT_COUNTERS=y
+CONFIG_COMPAT_BRK=y
+CONFIG_SLUB=y
+CONFIG_SLUB_CPU_PARTIAL=y
+CONFIG_SYSTEM_TRUSTED_KEYRING=y
+CONFIG_PROFILING=y
+CONFIG_TRACEPOINTS=y
+# CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS is not set
+# CONFIG_HAVE_ARCH_TRACEHOOK is not set
+# CONFIG_HAVE_DMA_ATTRS is not set
+# CONFIG_HAVE_DMA_CONTIGUOUS is not set
+CONFIG_GENERIC_SMP_IDLE_THREAD=y
+# CONFIG_HAVE_CLK is not set
+# CONFIG_HAVE_DMA_API_DEBUG is not set
+# CONFIG_HAVE_PERF_REGS is not set
+# CONFIG_HAVE_PERF_USER_STACK_DUMP is not set
+# CONFIG_HAVE_ARCH_JUMP_LABEL is not set
+# CONFIG_HAVE_RCU_TABLE_FREE is not set
+# CONFIG_HAVE_ALIGNED_STRUCT_PAGE is not set
+# CONFIG_HAVE_CMPXCHG_DOUBLE is not set
+CONFIG_ARCH_WANT_COMPAT_IPC_PARSE_VERSION=y
+# CONFIG_HAVE_ARCH_SECCOMP_FILTER is not set
+# CONFIG_SECCOMP_FILTER is not set
+# CONFIG_HAVE_CC_STACKPROTECTOR is not set
+CONFIG_CC_STACKPROTECTOR=y
+CONFIG_CC_STACKPROTECTOR_STRONG=y
+# CONFIG_HAVE_CONTEXT_TRACKING is not set
+# CONFIG_HAVE_VIRT_CPU_ACCOUNTING_GEN is not set
+# CONFIG_HAVE_IRQ_TIME_ACCOUNTING is not set
+# CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE is not set
+# CONFIG_MODULES_USE_ELF_RELA is not set
+# CONFIG_HAVE_ARCH_MMAP_RND_BITS is not set
+CONFIG_ARCH_MMAP_RND_BITS=18
+# CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS is not set
+CONFIG_ARCH_MMAP_RND_COMPAT_BITS=16
+CONFIG_CLONE_BACKWARDS=y
+CONFIG_OLD_SIGSUSPEND3=y
+CONFIG_COMPAT_OLD_SIGACTION=y
+# CONFIG_HAVE_GENERIC_DMA_COHERENT is not set
+CONFIG_RT_MUTEXES=y
+CONFIG_BASE_SMALL=0
+CONFIG_MODULES=y
+CONFIG_MODULE_UNLOAD=y
+CONFIG_MODULE_FORCE_UNLOAD=y
+CONFIG_MODVERSIONS=y
+# CONFIG_MODULE_SIG is not set
+# CONFIG_MODULE_SIG_FORCE is not set
+# CONFIG_MODULE_SIG_ALL is not set
+# CONFIG_MODULE_SIG_SHA512 is not set
+# CONFIG_MODULE_SIG_HASH="sha512"  is not set
+CONFIG_STOP_MACHINE=y
+CONFIG_BLOCK=y
+CONFIG_BLK_DEV_BSG=y
+CONFIG_PARTITION_ADVANCED=y
+CONFIG_MSDOS_PARTITION=y
+CONFIG_EFI_PARTITION=y
+CONFIG_BLOCK_COMPAT=y
+CONFIG_IOSCHED_NOOP=y
+CONFIG_IOSCHED_TEST=m
+CONFIG_IOSCHED_DEADLINE=y
+CONFIG_IOSCHED_CFQ=y
+CONFIG_DEFAULT_CFQ=y
+CONFIG_DEFAULT_IOSCHED="cfq"
+CONFIG_ASN1=y
+CONFIG_UNINLINE_SPIN_UNLOCK=y
+CONFIG_ARCH_SUPPORTS_ATOMIC_RMW=y
+CONFIG_MUTEX_SPIN_ON_OWNER=y
+CONFIG_RWSEM_SPIN_ON_OWNER=y
+CONFIG_FREEZER=y
+CONFIG_ARCH_MSM=y
+CONFIG_ARCH_MSM8916=y
+CONFIG_ARCH_MSM8917=y
+CONFIG_ARCH_MSM8920=y
+CONFIG_ARCH_MSM8940=y
+CONFIG_ARCH_MSM8953=y
+CONFIG_ARCH_MSM8937=y
+CONFIG_ARCH_MSMCOBALT=y
+CONFIG_ARM_AMBA=y
+CONFIG_PCI=y
+CONFIG_PCI_DOMAINS=y
+# CONFIG_PCI_DOMAINS_GENERIC is not set
+CONFIG_PCI_SYSCALL=y
+CONFIG_PCI_MSI=y
+CONFIG_PCI_MSI_IRQ_DOMAIN=y
+CONFIG_PCI_MSM=y
+CONFIG_PCI_LABEL=y
+CONFIG_ARM64_ERRATUM_826319=y
+CONFIG_ARM64_ERRATUM_827319=y
+CONFIG_ARM64_ERRATUM_824069=y
+CONFIG_ARM64_ERRATUM_819472=y
+CONFIG_ARM64_ERRATUM_832075=y
+CONFIG_ARM64_ERRATUM_845719=y
+CONFIG_ARM64_4K_PAGES=y
+CONFIG_ARCH_MSM8953_SOC_SETTINGS=y
+CONFIG_ARM64_VA_BITS_39=y
+CONFIG_ARM64_VA_BITS=39
+CONFIG_SCHED_MC=y
+CONFIG_NR_CPUS=8
+CONFIG_HOTPLUG_CPU=y
+CONFIG_ARCH_NR_GPIO=1024
+CONFIG_PREEMPT=y
+CONFIG_PREEMPT_COUNT=y
+CONFIG_HZ=100
+CONFIG_ARCH_HAS_HOLES_MEMORYMODEL=y
+CONFIG_ARCH_SPARSEMEM_ENABLE=y
+CONFIG_ARCH_SPARSEMEM_DEFAULT=y
+CONFIG_ARCH_SELECT_MEMORY_MODEL=y
+# CONFIG_HAVE_ARCH_PFN_VALID is not set
+CONFIG_HW_PERF_EVENTS=y
+CONFIG_SYS_SUPPORTS_HUGETLBFS=y
+CONFIG_ARCH_WANT_GENERAL_HUGETLB=y
+CONFIG_ARCH_WANT_HUGE_PMD_SHARE=y
+CONFIG_ARCH_HAS_CACHE_LINE_SIZE=y
+CONFIG_SELECT_MEMORY_MODEL=y
+CONFIG_SPARSEMEM_MANUAL=y
+CONFIG_SPARSEMEM=y
+# CONFIG_HAVE_MEMORY_PRESENT is not set
+CONFIG_SPARSEMEM_EXTREME=y
+CONFIG_SPARSEMEM_VMEMMAP_ENABLE=y
+CONFIG_SPARSEMEM_VMEMMAP=y
+# CONFIG_HAVE_MEMBLOCK is not set
+CONFIG_NO_BOOTMEM=y
+CONFIG_MEMORY_ISOLATION=y
+CONFIG_PAGEFLAGS_EXTENDED=y
+CONFIG_SPLIT_PTLOCK_CPUS=4
+CONFIG_COMPACTION=y
+CONFIG_MIGRATION=y
+CONFIG_PHYS_ADDR_T_64BIT=y
+CONFIG_ZONE_DMA_FLAG=1
+CONFIG_BOUNCE=y
+CONFIG_DEFAULT_MMAP_MIN_ADDR=4096
+CONFIG_CLEANCACHE=y
+CONFIG_CMA=y
+CONFIG_CMA_DEBUGFS=y
+CONFIG_CMA_AREAS=7
+CONFIG_ZBUD=y
+CONFIG_ZSMALLOC=y
+# CONFIG_GENERIC_EARLY_IOREMAP is not set
+CONFIG_ZCACHE=y
+CONFIG_KSWAPD_CPU_AFFINITY_MASK=""
+CONFIG_PROCESS_RECLAIM=y
+CONFIG_SECCOMP=y
+CONFIG_FORCE_MAX_ZONEORDER=11
+CONFIG_UNMAP_KERNEL_AT_EL0=y
+CONFIG_ARMV8_DEPRECATED=y
+CONFIG_SWP_EMULATION=y
+CONFIG_CP15_BARRIER_EMULATION=y
+CONFIG_SETEND_EMULATION=y
+CONFIG_ARM64_PAN=y
+CONFIG_ARM64_UAO=y
+CONFIG_CMDLINE=""
+CONFIG_EFI_STUB=y
+CONFIG_EFI=y
+CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE=y
+CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE_NAMES=""
+CONFIG_BUILD_ARM64_KERNEL_COMPRESSION_GZIP=y
+CONFIG_DMI=y
+CONFIG_BINFMT_ELF=y
+CONFIG_COMPAT_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+CONFIG_COREDUMP=y
+CONFIG_COMPAT=y
+CONFIG_SUSPEND=y
+CONFIG_SUSPEND_FREEZER=y
+CONFIG_WAKELOCK=y
+CONFIG_PM_SLEEP=y
+CONFIG_PM_SLEEP_SMP=y
+CONFIG_PM_AUTOSLEEP=y
+CONFIG_PM_WAKELOCKS=y
+CONFIG_PM_WAKELOCKS_LIMIT=0
+CONFIG_PM_RUNTIME=y
+CONFIG_PM=y
+CONFIG_PM_DEBUG=y
+CONFIG_PM_SLEEP_DEBUG=y
+CONFIG_PM_OPP=y
+CONFIG_PM_CLK=y
+CONFIG_CPU_PM=y
+CONFIG_SUSPEND_TIME=y
+CONFIG_SUSPEND_SKIP_SYNC=y
+CONFIG_ARCH_SUSPEND_POSSIBLE=y
+CONFIG_ARM64_CPU_SUSPEND=y
+CONFIG_CPU_IDLE=y
+CONFIG_CPU_IDLE_MULTIPLE_DRIVERS=y
+CONFIG_CPU_IDLE_GOV_LADDER=y
+CONFIG_CPU_IDLE_GOV_MENU=y
+CONFIG_CPU_FREQ=y
+CONFIG_CPU_FREQ_GOV_COMMON=y
+CONFIG_SCHED_FREQ_INPUT=y
+CONFIG_CPU_FREQ_STAT=y
+CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y
+CONFIG_CPU_FREQ_GOV_PERFORMANCE=y
+CONFIG_CPU_FREQ_GOV_POWERSAVE=y
+CONFIG_CPU_FREQ_GOV_USERSPACE=y
+CONFIG_CPU_FREQ_GOV_ONDEMAND=y
+CONFIG_CPU_FREQ_GOV_INTERACTIVE=y
+CONFIG_CPU_FREQ_GOV_CONSERVATIVE=y
+CONFIG_CPU_FREQ_MSM=y
+CONFIG_ARM64_ERRATUM_843419=y
+CONFIG_MSM8937_MSM8917_TECNO_DTB=y
+CONFIG_NET=y
+CONFIG_COMPAT_NETLINK_MESSAGES=y
+CONFIG_PACKET=y
+CONFIG_UNIX=y
+CONFIG_XFRM=y
+CONFIG_XFRM_ALGO=y
+CONFIG_XFRM_USER=y
+CONFIG_XFRM_STATISTICS=y
+CONFIG_XFRM_IPCOMP=y
+CONFIG_NET_KEY=y
+CONFIG_INET=y
+CONFIG_IP_MULTICAST=y
+CONFIG_IP_ADVANCED_ROUTER=y
+CONFIG_IP_MULTIPLE_TABLES=y
+CONFIG_IP_ROUTE_VERBOSE=y
+CONFIG_IP_PNP=y
+CONFIG_IP_PNP_DHCP=y
+CONFIG_NET_IP_TUNNEL=y
+CONFIG_NET_UDP_TUNNEL=y
+CONFIG_INET_AH=y
+CONFIG_INET_ESP=y
+CONFIG_INET_IPCOMP=y
+CONFIG_INET_XFRM_TUNNEL=y
+CONFIG_INET_TUNNEL=y
+CONFIG_INET_XFRM_MODE_TRANSPORT=y
+CONFIG_INET_XFRM_MODE_TUNNEL=y
+CONFIG_INET_DIAG=y
+CONFIG_INET_TCP_DIAG=y
+CONFIG_INET_DIAG_DESTROY=y
+CONFIG_TCP_CONG_CUBIC=y
+CONFIG_DEFAULT_TCP_CONG="cubic"
+CONFIG_IPV6=y
+CONFIG_IPV6_ROUTER_PREF=y
+CONFIG_IPV6_ROUTE_INFO=y
+CONFIG_IPV6_OPTIMISTIC_DAD=y
+CONFIG_INET6_AH=y
+CONFIG_INET6_ESP=y
+CONFIG_INET6_IPCOMP=y
+CONFIG_IPV6_MIP6=y
+CONFIG_INET6_XFRM_TUNNEL=y
+CONFIG_INET6_TUNNEL=y
+CONFIG_INET6_XFRM_MODE_TRANSPORT=y
+CONFIG_INET6_XFRM_MODE_TUNNEL=y
+CONFIG_INET6_XFRM_MODE_BEET=y
+CONFIG_IPV6_SIT=y
+CONFIG_IPV6_NDISC_NODETYPE=y
+CONFIG_IPV6_MULTIPLE_TABLES=y
+CONFIG_IPV6_SUBTREES=y
+CONFIG_ANDROID_PARANOID_NETWORK=y
+CONFIG_NET_ACTIVITY_STATS=y
+CONFIG_NETWORK_SECMARK=y
+CONFIG_NETFILTER=y
+CONFIG_NETFILTER_ADVANCED=y
+CONFIG_BRIDGE_NETFILTER=m
+CONFIG_NETFILTER_NETLINK=y
+CONFIG_NETFILTER_NETLINK_QUEUE=y
+CONFIG_NETFILTER_NETLINK_LOG=y
+CONFIG_NF_CONNTRACK=y
+CONFIG_NF_LOG_COMMON=y
+CONFIG_NF_CONNTRACK_MARK=y
+CONFIG_NF_CONNTRACK_SECMARK=y
+CONFIG_NF_CONNTRACK_PROCFS=y
+CONFIG_NF_CONNTRACK_EVENTS=y
+CONFIG_NF_CT_PROTO_DCCP=y
+CONFIG_NF_CT_PROTO_GRE=y
+CONFIG_NF_CT_PROTO_SCTP=y
+CONFIG_NF_CT_PROTO_UDPLITE=y
+CONFIG_NF_CONNTRACK_AMANDA=y
+CONFIG_NF_CONNTRACK_FTP=y
+CONFIG_NF_CONNTRACK_H323=y
+CONFIG_NF_CONNTRACK_IRC=y
+CONFIG_NF_CONNTRACK_BROADCAST=y
+CONFIG_NF_CONNTRACK_NETBIOS_NS=y
+CONFIG_NF_CONNTRACK_PPTP=y
+CONFIG_NF_CONNTRACK_SANE=y
+CONFIG_NF_CONNTRACK_TFTP=y
+CONFIG_NF_CT_NETLINK=y
+CONFIG_NF_NAT=y
+CONFIG_NF_NAT_NEEDED=y
+CONFIG_NF_NAT_PROTO_DCCP=y
+CONFIG_NF_NAT_PROTO_UDPLITE=y
+CONFIG_NF_NAT_PROTO_SCTP=y
+CONFIG_NF_NAT_AMANDA=y
+CONFIG_NF_NAT_FTP=y
+CONFIG_NF_NAT_IRC=y
+CONFIG_NF_NAT_TFTP=y
+CONFIG_NETFILTER_XTABLES=y
+CONFIG_NETFILTER_XT_MARK=y
+CONFIG_NETFILTER_XT_CONNMARK=y
+CONFIG_NETFILTER_XT_TARGET_CLASSIFY=y
+CONFIG_NETFILTER_XT_TARGET_CONNMARK=y
+CONFIG_NETFILTER_XT_TARGET_CONNSECMARK=y
+CONFIG_NETFILTER_XT_TARGET_CT=y
+CONFIG_NETFILTER_XT_TARGET_IDLETIMER=y
+CONFIG_NETFILTER_XT_TARGET_HARDIDLETIMER=y
+CONFIG_NETFILTER_XT_TARGET_LOG=y
+CONFIG_NETFILTER_XT_TARGET_MARK=y
+CONFIG_NETFILTER_XT_NAT=y
+CONFIG_NETFILTER_XT_TARGET_NETMAP=y
+CONFIG_NETFILTER_XT_TARGET_NFLOG=y
+CONFIG_NETFILTER_XT_TARGET_NFQUEUE=y
+CONFIG_NETFILTER_XT_TARGET_NOTRACK=y
+CONFIG_NETFILTER_XT_TARGET_REDIRECT=y
+CONFIG_NETFILTER_XT_TARGET_TEE=y
+CONFIG_NETFILTER_XT_TARGET_TPROXY=y
+CONFIG_NETFILTER_XT_TARGET_TRACE=y
+CONFIG_NETFILTER_XT_TARGET_SECMARK=y
+CONFIG_NETFILTER_XT_TARGET_TCPMSS=y
+CONFIG_NETFILTER_XT_MATCH_COMMENT=y
+CONFIG_NETFILTER_XT_MATCH_CONNLIMIT=y
+CONFIG_NETFILTER_XT_MATCH_CONNMARK=y
+CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y
+CONFIG_NETFILTER_XT_MATCH_DSCP=y
+CONFIG_NETFILTER_XT_MATCH_ECN=y
+CONFIG_NETFILTER_XT_MATCH_ESP=y
+CONFIG_NETFILTER_XT_MATCH_HASHLIMIT=y
+CONFIG_NETFILTER_XT_MATCH_HELPER=y
+CONFIG_NETFILTER_XT_MATCH_HL=y
+CONFIG_NETFILTER_XT_MATCH_IPRANGE=y
+CONFIG_NETFILTER_XT_MATCH_L2TP=y
+CONFIG_NETFILTER_XT_MATCH_LENGTH=y
+CONFIG_NETFILTER_XT_MATCH_LIMIT=y
+CONFIG_NETFILTER_XT_MATCH_MAC=y
+CONFIG_NETFILTER_XT_MATCH_MARK=y
+CONFIG_NETFILTER_XT_MATCH_MULTIPORT=y
+CONFIG_NETFILTER_XT_MATCH_POLICY=y
+CONFIG_NETFILTER_XT_MATCH_PKTTYPE=y
+CONFIG_NETFILTER_XT_MATCH_QTAGUID=y
+CONFIG_NETFILTER_XT_MATCH_QUOTA=y
+CONFIG_NETFILTER_XT_MATCH_QUOTA2=y
+CONFIG_NETFILTER_XT_MATCH_SOCKET=y
+CONFIG_NETFILTER_XT_MATCH_STATE=y
+CONFIG_NETFILTER_XT_MATCH_STATISTIC=y
+CONFIG_NETFILTER_XT_MATCH_STRING=y
+CONFIG_NETFILTER_XT_MATCH_TIME=y
+CONFIG_NETFILTER_XT_MATCH_U32=y
+CONFIG_NF_DEFRAG_IPV4=y
+CONFIG_NF_CONNTRACK_IPV4=y
+CONFIG_NF_CONNTRACK_PROC_COMPAT=y
+CONFIG_NF_LOG_IPV4=y
+CONFIG_NF_REJECT_IPV4=y
+CONFIG_NF_NAT_IPV4=y
+CONFIG_NF_NAT_MASQUERADE_IPV4=y
+CONFIG_NF_NAT_PROTO_GRE=y
+CONFIG_NF_NAT_PPTP=y
+CONFIG_NF_NAT_H323=y
+CONFIG_IP_NF_IPTABLES=y
+CONFIG_IP_NF_MATCH_AH=y
+CONFIG_IP_NF_MATCH_ECN=y
+CONFIG_IP_NF_MATCH_RPFILTER=y
+CONFIG_IP_NF_MATCH_TTL=y
+CONFIG_IP_NF_FILTER=y
+CONFIG_IP_NF_TARGET_REJECT=y
+CONFIG_IP_NF_NAT=y
+CONFIG_IP_NF_TARGET_MASQUERADE=y
+CONFIG_IP_NF_TARGET_NATTYPE_MODULE=y
+CONFIG_IP_NF_TARGET_NETMAP=y
+CONFIG_IP_NF_TARGET_REDIRECT=y
+CONFIG_IP_NF_MANGLE=y
+CONFIG_IP_NF_RAW=y
+CONFIG_IP_NF_SECURITY=y
+CONFIG_IP_NF_ARPTABLES=y
+CONFIG_IP_NF_ARPFILTER=y
+CONFIG_IP_NF_ARP_MANGLE=y
+CONFIG_NF_DEFRAG_IPV6=y
+CONFIG_NF_CONNTRACK_IPV6=y
+CONFIG_NF_REJECT_IPV6=y
+CONFIG_NF_LOG_IPV6=y
+CONFIG_IP6_NF_IPTABLES=y
+CONFIG_IP6_NF_MATCH_RPFILTER=y
+CONFIG_IP6_NF_FILTER=y
+CONFIG_IP6_NF_TARGET_REJECT=y
+CONFIG_IP6_NF_MANGLE=y
+CONFIG_IP6_NF_RAW=y
+CONFIG_BRIDGE_NF_EBTABLES=y
+CONFIG_BRIDGE_EBT_BROUTE=y
+CONFIG_L2TP=y
+CONFIG_L2TP_DEBUGFS=y
+CONFIG_L2TP_V3=y
+CONFIG_L2TP_IP=y
+CONFIG_L2TP_ETH=y
+CONFIG_STP=y
+CONFIG_BRIDGE=y
+CONFIG_BRIDGE_IGMP_SNOOPING=y
+# CONFIG_HAVE_NET_DSA is not set
+CONFIG_LLC=y
+CONFIG_NET_SCHED=y
+CONFIG_NET_SCH_HTB=y
+CONFIG_NET_SCH_PRIO=y
+CONFIG_NET_CLS_FW=y
+CONFIG_NET_CLS_U32=y
+CONFIG_CLS_U32_MARK=y
+CONFIG_NET_CLS_FLOW=y
+CONFIG_NET_EMATCH=y
+CONFIG_NET_EMATCH_STACK=32
+CONFIG_NET_EMATCH_CMP=y
+CONFIG_NET_EMATCH_NBYTE=y
+CONFIG_NET_EMATCH_U32=y
+CONFIG_NET_EMATCH_META=y
+CONFIG_NET_EMATCH_TEXT=y
+CONFIG_NET_CLS_ACT=y
+CONFIG_NET_SCH_FIFO=y
+CONFIG_RMNET_DATA=y
+CONFIG_RMNET_DATA_FC=y
+CONFIG_RMNET_DATA_DEBUG_PKT=y
+CONFIG_RPS=y
+CONFIG_RFS_ACCEL=y
+CONFIG_XPS=y
+CONFIG_NET_RX_BUSY_POLL=y
+CONFIG_BQL=y
+CONFIG_NET_FLOW_LIMIT=y
+CONFIG_SOCKEV_NLMCAST=y
+CONFIG_BT=y
+CONFIG_BT_RFCOMM=y
+CONFIG_BT_RFCOMM_TTY=y
+CONFIG_BT_BNEP=y
+CONFIG_BT_BNEP_MC_FILTER=y
+CONFIG_BT_BNEP_PROTO_FILTER=y
+CONFIG_BT_HIDP=y
+CONFIG_MSM_BT_POWER=y
+CONFIG_FIB_RULES=y
+CONFIG_WIRELESS=y
+CONFIG_WIRELESS_EXT=y
+CONFIG_WEXT_CORE=y
+CONFIG_WEXT_PROC=y
+CONFIG_WEXT_SPY=y
+CONFIG_WEXT_PRIV=y
+CONFIG_CFG80211=y
+CONFIG_NL80211_TESTMODE=y
+CONFIG_CFG80211_DEFAULT_PS=y
+CONFIG_CFG80211_INTERNAL_REGDB=y
+CONFIG_RFKILL=y
+CONFIG_RFKILL_PM=y
+CONFIG_RFKILL_LEDS=y
+CONFIG_IPC_ROUTER=y
+CONFIG_IPC_ROUTER_SECURITY=y
+# CONFIG_HAVE_BPF_JIT is not set
+CONFIG_TRIGGER_CRASH=y
+CONFIG_UEVENT_HELPER=y
+CONFIG_UEVENT_HELPER_PATH=""
+CONFIG_STANDALONE=y
+CONFIG_PREVENT_FIRMWARE_BUILD=y
+CONFIG_FW_LOADER=y
+CONFIG_FIRMWARE_IN_KERNEL=y
+CONFIG_EXTRA_FIRMWARE=""
+CONFIG_FW_LOADER_USER_HELPER=y
+CONFIG_FW_LOADER_USER_HELPER_FALLBACK=y
+CONFIG_WANT_DEV_COREDUMP=y
+CONFIG_ALLOW_DEV_COREDUMP=y
+CONFIG_DEV_COREDUMP=y
+# CONFIG_GENERIC_CPU_AUTOPROBE is not set
+CONFIG_SOC_BUS=y
+CONFIG_REGMAP=y
+CONFIG_REGMAP_I2C=y
+CONFIG_REGMAP_SPI=y
+CONFIG_REGMAP_SWR=y
+CONFIG_REGMAP_ALLOW_WRITE_DEBUGFS=y
+CONFIG_DMA_SHARED_BUFFER=y
+CONFIG_DMA_CMA=y
+CONFIG_CMA_SIZE_MBYTES=16
+CONFIG_CMA_SIZE_SEL_MBYTES=y
+CONFIG_CMA_ALIGNMENT=8
+CONFIG_DTC=y
+CONFIG_OF=y
+CONFIG_OF_FLATTREE=y
+CONFIG_OF_EARLY_FLATTREE=y
+CONFIG_OF_ADDRESS=y
+CONFIG_OF_ADDRESS_PCI=y
+CONFIG_OF_IRQ=y
+CONFIG_OF_NET=y
+CONFIG_OF_MDIO=y
+CONFIG_OF_PCI=y
+CONFIG_OF_PCI_IRQ=y
+CONFIG_OF_SPMI=y
+CONFIG_OF_RESERVED_MEM=y
+CONFIG_OF_SLIMBUS=y
+CONFIG_OF_BATTERYDATA=y
+CONFIG_BLK_DEV=y
+CONFIG_ZRAM=y
+CONFIG_BLK_DEV_LOOP=y
+CONFIG_BLK_DEV_LOOP_MIN_COUNT=8
+CONFIG_BLK_DEV_RAM=y
+CONFIG_BLK_DEV_RAM_COUNT=16
+CONFIG_BLK_DEV_RAM_SIZE=8192
+CONFIG_UID_STAT=y
+CONFIG_QSEECOM=y
+CONFIG_HDCP_QSEECOM=y
+CONFIG_UID_SYS_STATS=y
+CONFIG_USB_EXT_TYPE_C_PERICOM=y
+CONFIG_GET_HARDWARE_INFO=y
+CONFIG_EEPROM_93CX6=y
+# CONFIG_MSM_QDSP6V2_CODECS is not set
+CONFIG_MSM_ULTRASOUND=y
+CONFIG_SCSI_MOD=y
+CONFIG_SCSI=y
+CONFIG_SCSI_DMA=y
+CONFIG_SCSI_PROC_FS=y
+CONFIG_BLK_DEV_SD=y
+CONFIG_CHR_DEV_SG=y
+CONFIG_CHR_DEV_SCH=y
+CONFIG_SCSI_CONSTANTS=y
+CONFIG_SCSI_LOGGING=y
+CONFIG_SCSI_SCAN_ASYNC=y
+CONFIG_SCSI_LOWLEVEL=y
+CONFIG_SCSI_UFSHCD=y
+CONFIG_SCSI_UFSHCD_PLATFORM=y
+CONFIG_SCSI_UFS_QCOM=y
+CONFIG_SCSI_UFS_QCOM_ICE=y
+CONFIG_SCSI_UFS_TEST=m
+# CONFIG_HAVE_PATA_PLATFORM is not set
+CONFIG_MD=y
+CONFIG_BLK_DEV_DM_BUILTIN=y
+CONFIG_BLK_DEV_DM=y
+CONFIG_DM_BUFIO=y
+CONFIG_DM_CRYPT=y
+CONFIG_DM_REQ_CRYPT=y
+CONFIG_DM_VERITY=y
+CONFIG_DM_VERITY_HASH_PREFETCH_MIN_SIZE=1
+CONFIG_DM_VERITY_FEC=y
+CONFIG_NETDEVICES=y
+CONFIG_MII=y
+CONFIG_NET_CORE=y
+CONFIG_DUMMY=y
+CONFIG_TUN=y
+CONFIG_ETHERNET=y
+# CONFIG_NET_VENDOR_3COM is not set
+# CONFIG_NET_VENDOR_ADAPTEC is not set 
+# CONFIG_NET_VENDOR_AGERE is not set
+# CONFIG_NET_VENDOR_ALTEON is not set
+# CONFIG_NET_VENDOR_AMD is not set 
+# CONFIG_NET_VENDOR_ARC is not set
+# CONFIG_NET_VENDOR_ATHEROS is not set
+# CONFIG_NET_VENDOR_BROADCOM is not set
+# CONFIG_NET_VENDOR_BROCADE is not set 
+# CONFIG_NET_VENDOR_CHELSIO is not set
+# CONFIG_NET_VENDOR_CISCO is not set 
+# CONFIG_NET_VENDOR_DEC is not set
+# CONFIG_NET_VENDOR_DLINK is not
+# CONFIG_NET_VENDOR_EMULEX is not set
+# CONFIG_NET_VENDOR_EXAR is not set
+# CONFIG_NET_VENDOR_HP is not set 
+# CONFIG_NET_VENDOR_INTEL is not set
+# CONFIG_NET_VENDOR_I825XX is not set
+# CONFIG_NET_VENDOR_MARVELL is not set
+# CONFIG_NET_VENDOR_MELLANOX is not set
+# CONFIG_NET_VENDOR_MICREL is not set
+CONFIG_KS8851=y
+# CONFIG_NET_VENDOR_MICROCHIP is not set
+CONFIG_RNDIS_IPA=y
+CONFIG_MSM_RMNET_BAM=y
+# CONFIG_NET_VENDOR_MYRI is not set 
+# CONFIG_NET_VENDOR_NATSEMI is not set
+# CONFIG_NET_VENDOR_8390 is not set
+# CONFIG_NET_VENDOR_NVIDIA is not set
+# CONFIG_NET_VENDOR_OKI is not set
+# CONFIG_NET_PACKET_ENGINE is not set
+# CONFIG_NET_VENDOR_QLOGIC is not set 
+# CONFIG_NET_VENDOR_QUALCOMM is not set
+# CONFIG_NET_VENDOR_REALTEK is not set
+# CONFIG_NET_VENDOR_RDC is not set 
+# CONFIG_NET_VENDOR_SAMSUNG is not set
+# CONFIG_NET_VENDOR_SEEQ is not set
+# CONFIG_NET_VENDOR_SILAN is not set
+# CONFIG_NET_VENDOR_SIS is not set
+# CONFIG_NET_VENDOR_SMSC is not set
+# CONFIG_NET_VENDOR_STMICRO si not set
+# CONFIG_NET_VENDOR_SUN is not set
+# CONFIG_NET_VENDOR_TEHUTI is not set
+# CONFIG_NET_VENDOR_TI is not set
+# CONFIG_NET_VENDOR_VIA is not set
+# CONFIG_NET_VENDOR_WIZNET is not set
+CONFIG_PHYLIB=y
+CONFIG_PPP=y
+CONFIG_PPP_BSDCOMP=y
+CONFIG_PPP_DEFLATE=y
+CONFIG_PPP_FILTER=y
+CONFIG_PPP_MPPE=y
+CONFIG_PPP_MULTILINK=y
+CONFIG_PPPOE=y
+CONFIG_PPPOL2TP=y
+CONFIG_PPPOLAC=y
+CONFIG_PPPOPNS=y
+CONFIG_PPP_ASYNC=y
+CONFIG_PPP_SYNC_TTY=y
+CONFIG_SLHC=y
+CONFIG_USB_NET_DRIVERS=y
+CONFIG_USB_USBNET=y
+CONFIG_USB_NET_AX8817X=y
+CONFIG_USB_NET_AX88179_178A=y
+CONFIG_USB_NET_CDCETHER=y
+CONFIG_USB_NET_CDC_NCM=y
+CONFIG_USB_NET_SMSC75XX=y
+CONFIG_USB_NET_NET1080=y
+CONFIG_USB_NET_CDC_SUBSET=y
+CONFIG_USB_BELKIN=y
+CONFIG_USB_ARMLINUX=y
+CONFIG_USB_NET_ZAURUS=y
+CONFIG_WLAN=y
+CONFIG_WCNSS_CORE=y
+CONFIG_WCNSS_CORE_PRONTO=y
+CONFIG_WCNSS_REGISTER_DUMP_ON_BITE=y
+CONFIG_WCNSS_MEM_PRE_ALLOC=y
+CONFIG_CNSS_CRYPTO=y
+CONFIG_ATH_CARDS=y
+CONFIG_WIL6210=m
+CONFIG_WIL6210_ISR_COR=y
+CONFIG_WIL6210_TRACING=y
+CONFIG_WIL6210_PLATFORM_MSM=y
+CONFIG_CNSS=y
+CONFIG_CNSS_SDIO=y
+CONFIG_CLD_HL_SDIO_CORE=y
+CONFIG_CNSS_UTILS=y
+CONFIG_INPUT=y
+CONFIG_INPUT_MOUSEDEV=y
+CONFIG_INPUT_MOUSEDEV_PSAUX=y
+CONFIG_INPUT_MOUSEDEV_SCREEN_X=1024
+CONFIG_INPUT_MOUSEDEV_SCREEN_Y=768
+CONFIG_INPUT_EVDEV=y
+CONFIG_INPUT_EVBUG=m
+CONFIG_INPUT_KEYRESET=y
+CONFIG_INPUT_KEYCOMBO=y
+CONFIG_INPUT_KEYBOARD=y
+CONFIG_KEYBOARD_ATKBD=y
+CONFIG_KEYBOARD_GPIO=y
+CONFIG_INPUT_JOYSTICK=y
+CONFIG_JOYSTICK_XPAD=y
+CONFIG_INPUT_TABLET=y
+CONFIG_INPUT_TOUCHSCREEN=y
+CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_v21=y
+CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_I2C_v21=y
+CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_I2C_v26=y
+CONFIG_OF_TOUCHSCREEN=y
+CONFIG_TOUCHSCREEN_HIMAX_CHIPSET=y
+CONFIG_TOUCHSCREEN_HIMAX_I2C=y
+CONFIG_TOUCHSCREEN_HIMAX_DEBUG=y
+CONFIG_INPUT_MISC=y
+CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_v26=y
+CONFIG_INPUT_KEYCHORD=y
+CONFIG_INPUT_UINPUT=y
+CONFIG_INPUT_GPIO=y
+CONFIG_SERIO=y
+CONFIG_SERIO_SERPORT=y
+CONFIG_SERIO_LIBPS2=y
+CONFIG_INPUT_FINGERPRINT_SUNWAVE=y
+CONFIG_CDFINGER_FP=y
+CONFIG_INPUT_NOTIFY=y
+CONFIG_CHARGER_NOTIFY=y
+CONFIG_TTY=y
+CONFIG_UNIX98_PTYS=y
+CONFIG_SERIAL_EARLYCON=y
+CONFIG_SERIAL_CORE=y
+CONFIG_SERIAL_CORE_CONSOLE=y
+CONFIG_SERIAL_MSM_HS=y
+CONFIG_SERIAL_MSM_HSL=y
+CONFIG_SERIAL_MSM_HSL_CONSOLE=y
+CONFIG_SERIAL_MSM_SMD=y
+CONFIG_DIAG_CHAR=y
+CONFIG_DIAG_OVER_USB=y
+CONFIG_HW_RANDOM=y
+CONFIG_HW_RANDOM_MSM_LEGACY=y
+CONFIG_MSM_SMD_PKT=y
+CONFIG_MSM_ADSPRPC=y
+CONFIG_MSM_RDBG=m
+CONFIG_I2C=y
+CONFIG_I2C_BOARDINFO=y
+CONFIG_I2C_COMPAT=y
+CONFIG_I2C_CHARDEV=y
+CONFIG_I2C_MUX=y
+CONFIG_I2C_HELPER_AUTO=y
+CONFIG_I2C_MSM_V2=y
+CONFIG_SLIMBUS=y
+CONFIG_SLIMBUS_MSM_NGD=y
+CONFIG_SOUNDWIRE=y
+CONFIG_SOUNDWIRE_WCD_CTRL=y
+CONFIG_SPI=y
+CONFIG_SPI_DEBUG=y
+CONFIG_SPI_MASTER=y
+CONFIG_SPI_QUP=y
+CONFIG_SPI_SPIDEV=y
+CONFIG_PINCTRL=y
+CONFIG_PINMUX=y
+CONFIG_PINCONF=y
+# CONFIG_GENERIC_PINCONF is not set
+CONFIG_PINCTRL_MSM=y
+CONFIG_PINCTRL_MSM8952=y
+CONFIG_PINCTRL_MSM8937=y
+CONFIG_PINCTRL_MSMCOBALT=y
+CONFIG_PINCTRL_MSM8917=y
+CONFIG_PINCTRL_MSM8940=y
+CONFIG_PINCTRL_MSM8953=y
+# CONFIG_ARCH_HAVE_CUSTOM_GPIO_H is not set
+CONFIG_ARCH_WANT_OPTIONAL_GPIOLIB=y
+CONFIG_ARCH_REQUIRE_GPIOLIB=y
+CONFIG_GPIOLIB=y
+CONFIG_GPIO_DEVRES=y
+CONFIG_OF_GPIO=y
+CONFIG_GPIOLIB_IRQCHIP=y
+CONFIG_GPIO_SYSFS=y
+CONFIG_GPIO_QPNP_PIN=y
+CONFIG_GPIO_SX150X=y
+CONFIG_POWER_SUPPLY=y
+CONFIG_CHARGER_BQ2560X=y
+CONFIG_BQ27426_FG=y
+CONFIG_POWER_RESET=y
+CONFIG_POWER_RESET_MSM=y
+CONFIG_MSM_DLOAD_MODE=y
+CONFIG_POWER_REBOOT_EDL=y
+CONFIG_MSM_PM=y
+CONFIG_MSM_APM=y
+CONFIG_MSM_IDLE_STATS=y
+CONFIG_MSM_IDLE_STATS_FIRST_BUCKET=62500
+CONFIG_MSM_IDLE_STATS_BUCKET_SHIFT=2
+CONFIG_MSM_IDLE_STATS_BUCKET_COUNT=10
+CONFIG_MSM_SUSPEND_STATS_FIRST_BUCKET=1000000000
+CONFIG_HWMON=y
+CONFIG_SENSORS_EPM_ADC=y
+CONFIG_SENSORS_QPNP_ADC_VOLTAGE=y
+CONFIG_SENSORS_QPNP_ADC_CURRENT=y
+CONFIG_THERMAL=y
+CONFIG_THERMAL_HWMON=y
+CONFIG_THERMAL_OF=y
+CONFIG_THERMAL_WRITABLE_TRIPS=y
+CONFIG_THERMAL_DEFAULT_GOV_STEP_WISE=y
+CONFIG_THERMAL_GOV_STEP_WISE=y
+CONFIG_THERMAL_TSENS8974=y
+CONFIG_LIMITS_MONITOR=y
+CONFIG_LIMITS_LITE_HW=y
+CONFIG_THERMAL_MONITOR=y
+CONFIG_THERMAL_QPNP=y
+CONFIG_THERMAL_QPNP_ADC_TM=y
+CONFIG_SSB_POSSIBLE=y
+CONFIG_BCMA_POSSIBLE=y
+CONFIG_MFD_CORE=y
+CONFIG_WCD9335_CODEC=y
+CONFIG_REGULATOR=y
+CONFIG_REGULATOR_FIXED_VOLTAGE=y
+CONFIG_REGULATOR_STUB=y
+CONFIG_REGULATOR_FAN53555=y
+CONFIG_REGULATOR_MEM_ACC=y
+CONFIG_REGULATOR_RPM_SMD=y
+CONFIG_REGULATOR_QPNP=y
+CONFIG_REGULATOR_QPNP_LABIBB=y
+CONFIG_REGULATOR_SPM=y
+CONFIG_REGULATOR_CPR=y
+CONFIG_REGULATOR_CPR3=y
+CONFIG_REGULATOR_CPR3_HMSS=y
+CONFIG_REGULATOR_CPR3_MMSS=y
+CONFIG_REGULATOR_KRYO=y
+CONFIG_MEDIA_SUPPORT=y
+CONFIG_MEDIA_CAMERA_SUPPORT=y
+CONFIG_MEDIA_RADIO_SUPPORT=y
+CONFIG_MEDIA_CONTROLLER=y
+CONFIG_VIDEO_DEV=y
+CONFIG_VIDEO_V4L2_SUBDEV_API=y
+CONFIG_VIDEO_V4L2=y
+CONFIG_VIDEOBUF_GEN=y
+CONFIG_VIDEOBUF2_CORE=y
+CONFIG_VIDEOBUF2_MEMOPS=y
+CONFIG_VIDEOBUF2_VMALLOC=y
+CONFIG_V4L_PLATFORM_DRIVERS=y
+CONFIG_SOC_CAMERA=y
+CONFIG_SOC_CAMERA_PLATFORM=y
+CONFIG_MSM_VIDC_V4L2=y
+CONFIG_MSM_VIDC_VMEM=y
+CONFIG_MSM_VIDC_GOVERNORS=y
+CONFIG_MSM_CAMERA=y
+CONFIG_MSMB_CAMERA=y
+CONFIG_MSM_CAMERA_SENSOR=y
+CONFIG_MSM_CPP=y
+CONFIG_MSM_CCI=y
+CONFIG_MSM_CSI20_HEADER=y
+CONFIG_MSM_CSI22_HEADER=y
+CONFIG_MSM_CSI30_HEADER=y
+CONFIG_MSM_CSI31_HEADER=y
+CONFIG_MSM_CSIPHY=y
+CONFIG_MSM_CSID=y
+CONFIG_MSM_EEPROM=y
+CONFIG_MSM_ISPIF=y
+CONFIG_MSM_ISPIF_V2=y
+CONFIG_IMX134=y
+CONFIG_IMX132=y
+CONFIG_OV9724=y
+CONFIG_OV5648=y
+CONFIG_GC0339=y
+CONFIG_OV8825=y
+CONFIG_OV8865=y
+CONFIG_s5k4e1=y
+CONFIG_OV12830=y
+CONFIG_MSM_V4L2_VIDEO_OVERLAY_DEVICE=y
+CONFIG_MSMB_JPEG=y
+CONFIG_MSM_FD=y
+CONFIG_MSM_SEC_CCI_TA_NAME="seccamdemo64"
+CONFIG_RADIO_ADAPTERS=y
+CONFIG_RADIO_IRIS=y
+CONFIG_RADIO_IRIS_TRANSPORT=y
+CONFIG_RADIO_SILABS=y
+CONFIG_MEDIA_SUBDRV_AUTOSELECT=y
+CONFIG_MEDIA_ATTACH=y
+CONFIG_MEDIA_TUNER=y
+CONFIG_MEDIA_TUNER_SIMPLE=y
+CONFIG_MEDIA_TUNER_TDA8290=y
+CONFIG_MEDIA_TUNER_TDA827X=y
+CONFIG_MEDIA_TUNER_TDA18271=y
+CONFIG_MEDIA_TUNER_TDA9887=y
+CONFIG_MEDIA_TUNER_TEA5761=y
+CONFIG_MEDIA_TUNER_TEA5767=y
+CONFIG_MEDIA_TUNER_MT20XX=y
+CONFIG_MEDIA_TUNER_XC2028=y
+CONFIG_MEDIA_TUNER_XC5000=y
+CONFIG_MEDIA_TUNER_XC4000=y
+CONFIG_MEDIA_TUNER_MC44S803=y
+CONFIG_VGA_ARB=y
+CONFIG_VGA_ARB_MAX_GPUS=16
+CONFIG_MSM_KGSL=y
+CONFIG_MSM_ADRENO_DEFAULT_GOVERNOR="msm-adreno-tz"
+CONFIG_MSM_KGSL_IOMMU=y
+CONFIG_FB=y
+CONFIG_FB_CMDLINE=y
+CONFIG_FB_CFB_FILLRECT=y
+CONFIG_FB_CFB_COPYAREA=y
+CONFIG_FB_CFB_IMAGEBLIT=y
+CONFIG_FB_MSM=y
+CONFIG_MSM_DBA=y
+CONFIG_MSM_DBA_ADV7533=y
+CONFIG_FB_MSM_MDSS_COMMON=y
+CONFIG_FB_MSM_MDSS=y
+CONFIG_FB_MSM_MDSS_WRITEBACK=y
+CONFIG_FB_MSM_MDSS_XLOG_DEBUG=y
+CONFIG_BACKLIGHT_LCD_SUPPORT=y
+CONFIG_LCD_CLASS_DEVICE=m
+CONFIG_BACKLIGHT_CLASS_DEVICE=m
+# CONFIG_BACKLIGHT_GENERIC=m is not set
+CONFIG_SOUND=y
+CONFIG_SND=y
+# CONFIG_SND_TIMER is not set
+# CONFIG_SND_PCM is not set
+# CONFIG_SND_HWDEP is not set
+# CONFIG_SND_RAWMIDI is not set
+# CONFIG_SND_COMPRESS_OFFLOAD is not set
+# CONFIG_SND_JACK is not set
+# CONFIG_SND_DYNAMIC_MINORS is not set
+# CONFIG_SND_MAX_CARDS=32 is not set
+# CONFIG_SND_SUPPORT_OLD_API is not set
+# CONFIG_SND_VERBOSE_PROCFS is not set
+# CONFIG_SND_DRIVERS is not set 
+# CONFIG_SND_PCI is not set
+# CONFIG_SND_SPI is not set
+# CONFIG_SND_USB is not set
+CONFIG_SND_USB_AUDIO=y
+CONFIG_SND_SOC=y
+# CONFIG_SND_SOC_MSM_HOSTLESS_PCM is not set
+# CONFIG_SND_SOC_MSM_QDSP6V2_INTF is not set
+# CONFIG_SND_SOC_QDSP6V2 is not set
+CONFIG_DOLBY_DAP=y
+CONFIG_DOLBY_DS2=y
+CONFIG_DTS_EAGLE=y
+CONFIG_DTS_SRS_TM=y
+CONFIG_QTI_PP=y
+# CONFIG_SND_SOC_CPE is not set
+# CONFIG_SND_SOC_MSM8X16 is not set
+# CONFIG_SND_SOC_I2C_AND_SPI is not set
+# CONFIG_SND_SOC_WCD9330 is not set
+# CONFIG_SND_SOC_WCD9335 is not set
+# CONFIG_SND_SOC_WSA881X_SENSORS is not set
+# CONFIG_SND_SOC_WSA881X is not set
+# CONFIG_SND_SOC_WSA881X_ANALOG is not set
+# CONFIG_SND_SOC_MSM8X16_WCD is not set
+# CONFIG_SND_SOC_WCD9XXX is not set
+# CONFIG_SND_SOC_WCD9XXX_V2 is not set
+# CONFIG_SND_SOC_WCD_CPE is not set
+CONFIG_AUDIO_EXT_CLK=y
+# CONFIG_SND_SOC_WCD_MBHC is not set
+# CONFIG_SND_SOC_MSM_STUB is not set
+# CONFIG_SND_SOC_MSM_HDMI_DBA_CODEC_RX is not set
+CONFIG_HID=y
+CONFIG_HIDRAW=y
+CONFIG_UHID=y
+# CONFIG_HID_GENERIC is not set
+CONFIG_HID_APPLE=y
+CONFIG_HID_ELECOM=y
+CONFIG_HID_MAGICMOUSE=y
+CONFIG_HID_MICROSOFT=y
+CONFIG_HID_MULTITOUCH=y
+CONFIG_USB_HID=y
+CONFIG_USB_HIDDEV=y
+CONFIG_USB_OHCI_LITTLE_ENDIAN=y
+CONFIG_USB_SUPPORT=y
+CONFIG_USB_COMMON=y
+CONFIG_USB_ARCH_HAS_HCD=y
+CONFIG_USB=y
+CONFIG_USB_ANNOUNCE_NEW_DEVICES=y
+CONFIG_USB_DEFAULT_PERSIST=y
+CONFIG_USB_MON=y
+CONFIG_USB_XHCI_HCD=y
+CONFIG_USB_XHCI_PCI=y
+CONFIG_USB_XHCI_PLATFORM=y
+CONFIG_USB_EHCI_HCD=y
+CONFIG_USB_EHCI_ROOT_HUB_TT=y
+CONFIG_USB_EHCI_TT_NEWSCHED=y
+CONFIG_USB_EHCI_PCI=y
+CONFIG_USB_EHCI_MSM=y
+CONFIG_USB_EHCI_MSM_HSIC=y
+CONFIG_USB_ACM=y
+CONFIG_USB_STORAGE=y
+CONFIG_USB_STORAGE_DATAFAB=y
+CONFIG_USB_STORAGE_FREECOM=y
+CONFIG_USB_STORAGE_ISD200=y
+CONFIG_USB_STORAGE_USBAT=y
+CONFIG_USB_STORAGE_SDDR09=y
+CONFIG_USB_STORAGE_SDDR55=y
+CONFIG_USB_STORAGE_JUMPSHOT=y
+CONFIG_USB_STORAGE_ALAUDA=y
+CONFIG_USB_STORAGE_KARMA=y
+CONFIG_USB_STORAGE_CYPRESS_ATACB=y
+CONFIG_USB_DWC3=y
+CONFIG_USB_DWC3_DUAL_ROLE=y
+CONFIG_USB_DWC3_PCI=y
+CONFIG_USB_DWC3_MSM=y
+CONFIG_USB_SERIAL=y
+CONFIG_USB_EHSET_TEST_FIXTURE=y
+CONFIG_MICROCHIP_USB2533=y
+CONFIG_USB_PHY=y
+CONFIG_NOP_USB_XCEIV=y
+CONFIG_USB_MSM_OTG=y
+CONFIG_USB_MSM_HSPHY=y
+CONFIG_USB_MSM_SSPHY_QMP=y
+CONFIG_MSM_QUSB_PHY=y
+CONFIG_USB_GADGET=y
+CONFIG_USB_GADGET_DEBUG_FILES=y
+CONFIG_USB_GADGET_DEBUG_FS=y
+CONFIG_USB_GADGET_VBUS_DRAW=500
+CONFIG_USB_GADGET_STORAGE_NUM_BUFFERS=2
+CONFIG_USB_CI13XXX_MSM=y
+CONFIG_USB_LIBCOMPOSITE=y
+CONFIG_USB_F_ACM=y
+CONFIG_USB_U_SERIAL=y
+CONFIG_USB_F_SERIAL=y
+CONFIG_USB_F_NCM=y
+CONFIG_USB_F_ECM=y
+CONFIG_USB_F_MASS_STORAGE=y
+CONFIG_USB_F_FS=y
+CONFIG_USB_F_UAC1=y
+CONFIG_USB_F_UAC2=y
+CONFIG_USB_F_UVC=y
+CONFIG_USB_F_AUDIO_SRC=y
+CONFIG_USB_G_ANDROID=y
+CONFIG_MMC=y
+CONFIG_MMC_PERF_PROFILING=y
+CONFIG_MMC_CLKGATE=y
+CONFIG_MMC_PARANOID_SD_INIT=y
+CONFIG_MMC_BLOCK=y
+CONFIG_MMC_BLOCK_MINORS=32
+CONFIG_MMC_BLOCK_BOUNCE=y
+CONFIG_MMC_TEST=m
+CONFIG_MMC_BLOCK_TEST=m
+CONFIG_MMC_SDHCI=y
+CONFIG_MMC_SDHCI_PLTFM=y
+CONFIG_MMC_SDHCI_MSM=y
+CONFIG_MMC_SDHCI_MSM_ICE=y
+CONFIG_MMC_CQ_HCI=y
+CONFIG_NEW_LEDS=y
+CONFIG_LEDS_CLASS=y
+CONFIG_LEDS_GPIO=y
+CONFIG_LEDS_QPNP=y
+CONFIG_LEDS_QPNP_FLASH=y
+CONFIG_LEDS_QPNP_WLED=y
+CONFIG_LEDS_TRIGGERS=y
+CONFIG_SWITCH=y
+CONFIG_EDAC_SUPPORT=y
+CONFIG_EDAC=y
+CONFIG_EDAC_LEGACY_SYSFS=y
+CONFIG_EDAC_MM_EDAC=y
+CONFIG_EDAC_CORTEX_ARM64=y
+CONFIG_EDAC_CORTEX_ARM64_PANIC_ON_CE=y
+CONFIG_EDAC_CORTEX_ARM64_PANIC_ON_UE=y
+CONFIG_RTC_LIB=y
+CONFIG_RTC_CLASS=y
+CONFIG_RTC_HCTOSYS=y
+CONFIG_RTC_SYSTOHC=y
+CONFIG_RTC_HCTOSYS_DEVICE="rtc0"
+CONFIG_RTC_INTF_SYSFS=y
+CONFIG_RTC_INTF_PROC=y
+CONFIG_RTC_INTF_DEV=y
+CONFIG_RTC_DRV_QPNP=y
+CONFIG_DMADEVICES=y
+CONFIG_DMA_ENGINE=y
+CONFIG_DMA_OF=y
+CONFIG_UIO=y
+CONFIG_UIO_MSM_SHAREDMEM=y
+CONFIG_STAGING=y
+CONFIG_ANDROID=y
+CONFIG_ANDROID_BINDER_IPC=y
+CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
+CONFIG_ASHMEM=y
+CONFIG_ANDROID_TIMED_OUTPUT=y
+CONFIG_ANDROID_TIMED_GPIO=y
+CONFIG_ANDROID_LOW_MEMORY_KILLER=y
+CONFIG_ANDROID_LOW_MEMORY_KILLER_AUTODETECT_OOM_ADJ_VALUES=y
+CONFIG_SYNC=y
+CONFIG_SW_SYNC=y
+CONFIG_SW_SYNC_USER=y
+CONFIG_ONESHOT_SYNC=y
+CONFIG_ION=y
+CONFIG_ION_MSM=y
+CONFIG_MSM_AVTIMER=y
+CONFIG_MSM_BUS_SCALING=y
+CONFIG_BUS_TOPOLOGY_ADHOC=y
+CONFIG_QPNP_POWER_ON=y
+CONFIG_QPNP_REVID=y
+CONFIG_QPNP_COINCELL=y
+CONFIG_SPS=y
+CONFIG_USB_BAM=y
+CONFIG_SPS_SUPPORT_NDP_BAM=y
+CONFIG_IPA=y
+CONFIG_RMNET_IPA=y
+CONFIG_GPIO_USB_DETECT=y
+CONFIG_MSM_11AD=y
+CONFIG_BW_MONITOR=y
+CONFIG_MSM_SPMI=y
+CONFIG_MSM_SPMI_PMIC_ARB=y
+CONFIG_MSM_QPNP_INT=y
+CONFIG_MSM_SPMI_DEBUGFS_RO=y
+CONFIG_CLKDEV_LOOKUP=y
+# CONFIG_HAVE_CLK_PREPARE is not set
+CONFIG_MSM_CLK_CONTROLLER_V2=y
+CONFIG_MSM_MDSS_PLL=y
+CONFIG_HWSPINLOCK=y
+CONFIG_REMOTE_SPINLOCK_MSM=y
+CONFIG_CLKSRC_OF=y
+CONFIG_ARM_ARCH_TIMER=y
+CONFIG_ARM_ARCH_TIMER_EVTSTREAM=y
+CONFIG_IOMMU_API=y
+CONFIG_IOMMU_SUPPORT=y
+CONFIG_IOMMU_IO_PGTABLE=y
+CONFIG_IOMMU_IO_PGTABLE_LPAE=y
+CONFIG_OF_IOMMU=y
+CONFIG_MSM_IOMMU=y
+CONFIG_MSM_IOMMU_V1=y
+CONFIG_ARM_SMMU=y
+CONFIG_IOMMU_DEBUG=y
+CONFIG_IOMMU_TESTS=y
+CONFIG_MSM_INRUSH_CURRENT_MITIGATION=y
+CONFIG_MSM_QDSP6_APRV2=y
+CONFIG_MSM_ADSP_LOADER=y
+CONFIG_MSM_MEMORY_DUMP_V2=y
+CONFIG_MSM_BOOT_STATS=y
+CONFIG_MSM_CPUSS_DUMP=y
+CONFIG_MSM_COMMON_LOG=y
+CONFIG_MSM_DDR_HEALTH=y
+CONFIG_MSM_WATCHDOG_V2=y
+CONFIG_MSM_FORCE_WDOG_BITE_ON_PANIC=y
+CONFIG_MSM_CPU_PWR_CTL=y
+CONFIG_MSM_RPM_SMD=y
+CONFIG_MSM_RPM_RBCPR_STATS_V2_LOG=y
+CONFIG_MSM_RPM_LOG=y
+CONFIG_MSM_RPM_STATS_LOG=y
+CONFIG_MSM_RUN_QUEUE_STATS=y
+CONFIG_MSM_SCM=y
+CONFIG_MSM_SCM_XPU=y
+CONFIG_MSM_XPU_ERR_FATAL=y
+CONFIG_MSM_MPM_OF=y
+CONFIG_MSM_SMEM=y
+CONFIG_MSM_SMD=y
+CONFIG_MSM_SMD_DEBUG=y
+CONFIG_MSM_GLINK=y
+CONFIG_MSM_GLINK_LOOPBACK_SERVER=y
+CONFIG_MSM_GLINK_SMD_XPRT=y
+CONFIG_MSM_GLINK_SMEM_NATIVE_XPRT=y
+CONFIG_MSM_SMEM_LOGGING=y
+CONFIG_MSM_SMP2P=y
+CONFIG_MSM_SMP2P_TEST=y
+CONFIG_MSM_SPM=y
+CONFIG_MSM_L2_SPM=y
+CONFIG_MSM_QMI_INTERFACE=y
+CONFIG_MSM_IPC_ROUTER_SMD_XPRT=y
+CONFIG_MSM_EVENT_TIMER=y
+CONFIG_MSM_SUBSYSTEM_RESTART=y
+CONFIG_MSM_SYSMON_COMM=y
+CONFIG_MSM_PIL=y
+CONFIG_MSM_PIL_SSR_GENERIC=y
+CONFIG_MSM_PIL_MSS_QDSP6V5=y
+CONFIG_MSM_SECURE_BUFFER=y
+CONFIG_MSM_BAM_DMUX=y
+CONFIG_MSM_PERFORMANCE=y
+CONFIG_MSM_KERNEL_PROTECT=y
+CONFIG_MSM_KERNEL_PROTECT_MPU=y
+CONFIG_QCOM_EARLY_RANDOM=y
+CONFIG_MEM_SHARE_QMI_SERVICE=y
+CONFIG_PM_DEVFREQ=y
+CONFIG_DEVFREQ_GOV_SIMPLE_ONDEMAND=y
+CONFIG_DEVFREQ_GOV_PERFORMANCE=y
+CONFIG_DEVFREQ_GOV_POWERSAVE=y
+CONFIG_DEVFREQ_GOV_USERSPACE=y
+CONFIG_DEVFREQ_GOV_CPUFREQ=y
+CONFIG_DEVFREQ_GOV_MSM_ADRENO_TZ=y
+CONFIG_MSM_BIMC_BWMON=y
+CONFIG_DEVFREQ_GOV_MSM_GPUBW_MON=y
+CONFIG_ARM_MEMLAT_MON=y
+CONFIG_MSMCCI_HWMON=y
+CONFIG_MSM_M4M_HWMON=y
+CONFIG_DEVFREQ_GOV_MSM_BW_HWMON=y
+CONFIG_DEVFREQ_GOV_MSM_CACHE_HWMON=y
+CONFIG_DEVFREQ_GOV_SPDM_HYP=y
+CONFIG_DEVFREQ_GOV_MEMLAT=y
+CONFIG_DEVFREQ_SIMPLE_DEV=y
+CONFIG_MSM_DEVFREQ_DEVBW=y
+CONFIG_SPDM_SCM=y
+CONFIG_DEVFREQ_SPDM=y
+CONFIG_PWM=y
+CONFIG_PWM_SYSFS=y
+CONFIG_PWM_QPNP=y
+CONFIG_IRQCHIP=y
+CONFIG_ARM_GIC=y
+CONFIG_ARM_GIC_V2M=y
+CONFIG_ARM_GIC_V3=y
+CONFIG_ARM_GIC_PANIC_HANDLER=y
+CONFIG_ARM_GIC_V3_ITS=y
+CONFIG_MSM_SHOW_RESUME_IRQ=y
+CONFIG_MSM_IRQ=y
+# CONFIG_GENERIC_PHY is not set
+CONFIG_PHY_QCOM_UFS=y
+CONFIG_RAS=y
+CONFIG_SENSORS_SSC=y
+CONFIG_DMIID=y
+CONFIG_EFI_PARAMS_FROM_FDT=y
+CONFIG_EFI_RUNTIME_WRAPPERS=y
+CONFIG_EFI_ARMSTUB=y
+CONFIG_MSM_TZ_LOG=y
+CONFIG_DCACHE_WORD_ACCESS=y
+CONFIG_EXT2_FS=y
+CONFIG_EXT2_FS_XATTR=y
+CONFIG_EXT3_FS=y
+CONFIG_EXT3_FS_XATTR=y
+CONFIG_EXT4_FS=y
+CONFIG_EXT4_FS_SECURITY=y
+CONFIG_JBD=y
+CONFIG_JBD2=y
+CONFIG_FS_MBCACHE=y
+CONFIG_FS_POSIX_ACL=y
+CONFIG_FILE_LOCKING=y
+CONFIG_FSNOTIFY=y
+CONFIG_DNOTIFY=y
+CONFIG_INOTIFY_USER=y
+CONFIG_QUOTA=y
+CONFIG_QUOTA_NETLINK_INTERFACE=y
+CONFIG_QUOTA_TREE=y
+CONFIG_QFMT_V2=y
+CONFIG_QUOTACTL=y
+CONFIG_FUSE_FS=y
+CONFIG_FAT_FS=y
+CONFIG_MSDOS_FS=y
+CONFIG_VFAT_FS=y
+CONFIG_FAT_DEFAULT_CODEPAGE=437
+CONFIG_FAT_DEFAULT_IOCHARSET="iso8859-1"
+CONFIG_PROC_FS=y
+CONFIG_PROC_SYSCTL=y
+CONFIG_PROC_PAGE_MONITOR=y
+CONFIG_KERNFS=y
+CONFIG_SYSFS=y
+CONFIG_TMPFS=y
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_TMPFS_XATTR=y
+CONFIG_CONFIGFS_FS=y
+CONFIG_MISC_FILESYSTEMS=y
+CONFIG_SDCARD_FS=y
+CONFIG_NETWORK_FILESYSTEMS=y
+CONFIG_NLS=y
+CONFIG_NLS_DEFAULT="iso8859-1"
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ASCII=y
+CONFIG_NLS_ISO8859_1=y
+CONFIG_PRINTK_TIME=y
+CONFIG_MESSAGE_LOGLEVEL_DEFAULT=4
+CONFIG_DEBUG_INFO=y
+CONFIG_ENABLE_WARN_DEPRECATED=y
+CONFIG_ENABLE_MUST_CHECK=y
+CONFIG_FRAME_WARN=2048
+CONFIG_DEBUG_FS=y
+CONFIG_ARCH_WANT_FRAME_POINTERS=y
+CONFIG_FRAME_POINTER=y
+CONFIG_MAGIC_SYSRQ=y
+CONFIG_MAGIC_SYSRQ_DEFAULT_ENABLE=0x1
+CONFIG_DEBUG_KERNEL=y
+# CONFIG_HAVE_DEBUG_KMEMLEAK is not set
+# CONFIG_HAVE_ARCH_KASAN is not set
+CONFIG_PANIC_ON_OOPS_VALUE=0
+CONFIG_PANIC_TIMEOUT=5
+CONFIG_PANIC_ON_RECURSIVE_FAULT=y
+CONFIG_SCHEDSTATS=y
+CONFIG_SCHED_STACK_END_CHECK=y
+CONFIG_TIMER_STATS=y
+CONFIG_DEBUG_PREEMPT=y
+CONFIG_STACKTRACE=y
+# CONFIG_HAVE_DEBUG_BUGVERBOSE is not set
+CONFIG_DEBUG_BUGVERBOSE=y
+CONFIG_RCU_CPU_STALL_TIMEOUT=21
+CONFIG_RCU_CPU_STALL_VERBOSE=y
+CONFIG_NOP_TRACER=y
+# CONFIG_HAVE_FUNCTION_TRACER is not set
+# CONFIG_HAVE_FUNCTION_GRAPH_TRACER is not set
+# CONFIG_HAVE_DYNAMIC_FTRACE is not set
+# CONFIG_HAVE_FTRACE_MCOUNT_RECORD is not set
+# CONFIG_HAVE_SYSCALL_TRACEPOINTS is not set
+# CONFIG_HAVE_C_RECORDMCOUNT is not set
+CONFIG_TRACE_CLOCK=y
+CONFIG_RING_BUFFER=y
+CONFIG_EVENT_TRACING=y
+CONFIG_CONTEXT_SWITCH_TRACER=y
+CONFIG_IPC_LOGGING=y
+CONFIG_TRACING=y
+# CONFIG_GENERIC_TRACER is not set
+CONFIG_TRACING_SUPPORT=y
+CONFIG_FTRACE=y
+CONFIG_BRANCH_PROFILE_NONE=y
+CONFIG_CPU_FREQ_SWITCH_PROFILER=y
+# CONFIG_HAVE_ARCH_KGDB is not set
+CONFIG_ARCH_HAS_UBSAN_SANITIZE_ALL=y
+CONFIG_DEBUG_SET_MODULE_RONX=y
+CONFIG_DEBUG_RODATA=y
+CONFIG_KEYS=y
+CONFIG_SECURITY_PERF_EVENTS_RESTRICT=y
+CONFIG_SECURITY=y
+CONFIG_SECURITY_NETWORK=y
+CONFIG_LSM_MMAP_MIN_ADDR=4096
+# CONFIG_HAVE_HARDENED_USERCOPY_ALLOCATOR is not set
+# CONFIG_HAVE_ARCH_HARDENED_USERCOPY is not set
+CONFIG_HARDENED_USERCOPY=y
+CONFIG_SECURITY_SELINUX=y
+CONFIG_SECURITY_SELINUX_DEVELOP=y
+CONFIG_SECURITY_SELINUX_AVC_STATS=y
+CONFIG_SECURITY_SELINUX_CHECKREQPROT_VALUE=1
+CONFIG_INTEGRITY=y
+CONFIG_INTEGRITY_AUDIT=y
+CONFIG_DEFAULT_SECURITY_SELINUX=y
+CONFIG_DEFAULT_SECURITY="selinux"
+CONFIG_CRYPTO=y
+CONFIG_CRYPTO_ALGAPI=y
+CONFIG_CRYPTO_ALGAPI2=y
+CONFIG_CRYPTO_AEAD=y
+CONFIG_CRYPTO_AEAD2=y
+CONFIG_CRYPTO_BLKCIPHER=y
+CONFIG_CRYPTO_BLKCIPHER2=y
+CONFIG_CRYPTO_HASH=y
+CONFIG_CRYPTO_HASH2=y
+CONFIG_CRYPTO_RNG=y
+CONFIG_CRYPTO_RNG2=y
+CONFIG_CRYPTO_PCOMP2=y
+CONFIG_CRYPTO_MANAGER=y
+CONFIG_CRYPTO_MANAGER2=y
+CONFIG_CRYPTO_MANAGER_DISABLE_TESTS=y
+CONFIG_CRYPTO_GF128MUL=y
+CONFIG_CRYPTO_NULL=y
+CONFIG_CRYPTO_WORKQUEUE=y
+CONFIG_CRYPTO_CRYPTD=y
+CONFIG_CRYPTO_AUTHENC=y
+CONFIG_CRYPTO_ABLK_HELPER=y
+CONFIG_CRYPTO_SEQIV=y
+CONFIG_CRYPTO_CBC=y
+CONFIG_CRYPTO_CTR=y
+CONFIG_CRYPTO_ECB=y
+CONFIG_CRYPTO_XTS=y
+CONFIG_CRYPTO_HMAC=y
+CONFIG_CRYPTO_XCBC=y
+CONFIG_CRYPTO_CRC32C=y
+CONFIG_CRYPTO_MD4=y
+CONFIG_CRYPTO_MD5=y
+CONFIG_CRYPTO_SHA1=y
+CONFIG_CRYPTO_SHA256=y
+CONFIG_CRYPTO_SHA512=y
+CONFIG_CRYPTO_AES=y
+CONFIG_CRYPTO_ARC4=y
+CONFIG_CRYPTO_DES=y
+CONFIG_CRYPTO_TWOFISH=y
+CONFIG_CRYPTO_TWOFISH_COMMON=y
+CONFIG_CRYPTO_DEFLATE=y
+CONFIG_CRYPTO_LZO=y
+CONFIG_CRYPTO_ANSI_CPRNG=m
+CONFIG_CRYPTO_HASH_INFO=y
+CONFIG_CRYPTO_HW=y
+CONFIG_CRYPTO_DEV_QCE50=y
+CONFIG_CRYPTO_DEV_QCRYPTO=y
+CONFIG_CRYPTO_DEV_QCOM_MSM_QCE=y
+CONFIG_CRYPTO_DEV_QCEDEV=y
+CONFIG_CRYPTO_DEV_OTA_CRYPTO=y
+CONFIG_CRYPTO_DEV_QCOM_ICE=y
+CONFIG_ASYMMETRIC_KEY_TYPE=y
+CONFIG_ASYMMETRIC_PUBLIC_KEY_SUBTYPE=y
+CONFIG_PUBLIC_KEY_ALGO_RSA=y
+CONFIG_X509_CERTIFICATE_PARSER=y
+CONFIG_ARM64_CRYPTO=y
+CONFIG_CRYPTO_SHA1_ARM64_CE=y
+CONFIG_CRYPTO_SHA2_ARM64_CE=y
+CONFIG_CRYPTO_GHASH_ARM64_CE=y
+CONFIG_CRYPTO_AES_ARM64_CE=y
+CONFIG_CRYPTO_AES_ARM64_CE_CCM=y
+CONFIG_CRYPTO_AES_ARM64_CE_BLK=y
+CONFIG_CRYPTO_AES_ARM64_NEON_BLK=y
+CONFIG_BINARY_PRINTF=y
+CONFIG_BITREVERSE=y
+# CONFIG_GENERIC_STRNCPY_FROM_USER is not set
+# CONFIG_GENERIC_STRNLEN_USER is not set
+# CONFIG_GENERIC_NET_UTILS is not set
+# CONFIG_GENERIC_PCI_IOMAP is not set
+# CONFIG_GENERIC_IOMAP is not set
+# CONFIG_GENERIC_IO is not set
+CONFIG_ARCH_USE_CMPXCHG_LOCKREF=y
+CONFIG_CRC_CCITT=y
+CONFIG_CRC16=y
+CONFIG_CRC32=y
+CONFIG_CRC32_SLICEBY8=y
+CONFIG_LIBCRC32C=y
+# CONFIG_AUDIT_GENERIC is not set
+# CONFIG_AUDIT_ARCH_COMPAT_GENERIC is not set
+# CONFIG_AUDIT_COMPAT_GENERIC is not set
+CONFIG_ZLIB_INFLATE=y
+CONFIG_ZLIB_DEFLATE=y
+CONFIG_LZO_COMPRESS=y
+CONFIG_LZO_DECOMPRESS=y
+CONFIG_DECOMPRESS_GZIP=y
+CONFIG_DECOMPRESS_BZIP2=y
+CONFIG_DECOMPRESS_LZMA=y
+# CONFIG_GENERIC_ALLOCATOR is not set
+# CONFIG_REED_SOLOMON is not set
+# CONFIG_REED_SOLOMON_DEC8 is not set
+CONFIG_TEXTSEARCH=y
+CONFIG_TEXTSEARCH_KMP=y
+CONFIG_TEXTSEARCH_BM=y
+CONFIG_TEXTSEARCH_FSM=y
+CONFIG_ASSOCIATIVE_ARRAY=y
+CONFIG_HAS_IOMEM=y
+CONFIG_HAS_IOPORT_MAP=y
+CONFIG_HAS_DMA=y
+CONFIG_CPU_RMAP=y
+CONFIG_DQL=y
+CONFIG_NLATTR=y
+CONFIG_ARCH_HAS_ATOMIC64_DEC_IF_POSITIVE=y
+CONFIG_CLZ_TAB=y
+CONFIG_MPILIB=y
+CONFIG_LIBFDT=y
+CONFIG_OID_REGISTRY=y
+CONFIG_UCS2_STRING=y
+CONFIG_ARCH_HAS_SG_CHAIN=y
+CONFIG_QMI_ENCDEC=y
